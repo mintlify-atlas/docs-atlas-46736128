@@ -1,0 +1,59 @@
+{
+  "projectType": "general",
+  "projectName": "BlueHammer",
+  "projectDescription": "A Windows security research proof-of-concept demonstrating a vulnerability chain that abuses Windows Defender's privileged update mechanism to extract the SAM database and escalate privileges via NTLM hash decryption.",
+  "theme": "aspen",
+  "primaryColor": "#1a6bc4",
+  "lightColor": "#dce9f8",
+  "darkColor": "#0d3a6e",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Overview",
+        "pages": ["introduction", "how-it-works"]
+      },
+      {
+        "group": "Vulnerability Details",
+        "pages": [
+          "vulnerability/windows-defender-update-abuse",
+          "vulnerability/vss-freeze-technique",
+          "vulnerability/sam-extraction"
+        ]
+      },
+      {
+        "group": "Building & Running",
+        "pages": [
+          "usage/prerequisites",
+          "usage/building",
+          "usage/running"
+        ]
+      },
+      {
+        "group": "Technical Reference",
+        "pages": [
+          "reference/attack-chain",
+          "reference/key-functions",
+          "reference/mitigations"
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Windows Defender RPC abuse via ServerMpUpdateEngineSignature to trigger privileged file operations",
+    "Volume Shadow Copy (VSS) creation timing exploit using EICAR test file and oplock synchronization",
+    "Windows Defender freeze via Cloud Files API (CldApi) callback and batch oplock on update file",
+    "NT object manager symbolic link injection to redirect WD's privileged file read to the SAM hive",
+    "Offline SAM hive parsing with LSA boot key extraction and AES/DES NTLM hash decryption",
+    "Privilege escalation by temporarily changing user passwords and launching processes as admin/SYSTEM"
+  ],
+  "publicApiSurface": [
+    "CallWD() — invokes ServerMpUpdateEngineSignature via Windows Defender ALPC/RPC",
+    "TriggerWDForVS() — orchestrates VSS creation by triggering WD with EICAR file",
+    "FreezeVSS() — freezes WD mid-scan using Cloud Files sync root and batch oplock",
+    "ShadowCopyFinderThread() — detects newly created VSS volume in NT object directory",
+    "DoSpawnShellAsAllUsers() — reads SAM hive, decrypts hashes, spawns shells as each local user",
+    "GetLSASecretKey() — extracts the Windows boot key from LSA registry subkeys",
+    "UnprotectNTHash() — decrypts SAM NTLM password hashes using AES+DES key derivation",
+    "ChangeUserPassword() — changes a local user's password via SamiChangePasswordUser RPC"
+  ]
+}

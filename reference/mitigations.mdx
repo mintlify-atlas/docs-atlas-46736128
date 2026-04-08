@@ -1,0 +1,107 @@
+---
+title: "Mitigations"
+description: "Known mitigations and defensive measures for the vulnerability chain demonstrated by BlueHammer."
+---
+
+<Note>
+  This analysis is research-based. Mitigation effectiveness depends on the specific Windows and Windows Defender versions in your environment. Always apply Microsoft security updates as the primary defense.
+</Note>
+
+## Vulnerability summary
+
+BlueHammer chains four distinct weaknesses:
+
+1. `ServerMpUpdateEngineSignature` accepts a caller-controlled directory path with no privilege validation
+2. Windows Defender follows reparse points (junctions and NT object-manager symlinks) when reading update files
+3. Batch oplocks can be used to deterministically freeze WD's I/O at a precise moment
+4. VSS snapshots of the SAM hive are accessible from user-mode via the `\Device\HarddiskVolumeShadowCopyN` device path
+
+## Mitigations by stage
+
+### Stage 1 — Update path validation
+
+**What breaks the attack**: Windows Defender should validate that the directory path passed to `ServerMpUpdateEngineSignature` is under a trusted location (e.g., `C:\ProgramData\Microsoft\Windows Defender\`) and is not writable by the calling user.
+
+**Current behavior**: The RPC method (`Proc42`) accepts any path string from any caller that can reach the ALPC port. The PoC passes a path under `%TEMP%` without any validation failure.
+
+**Recommended control**: Restrict access to the `IMpService` ALPC port to callers with `SeImpersonatePrivilege` or a specific integrity level, or validate the update path server-side against an allowlist.
+
+---
+
+### Stage 2 — Reparse point following
+
+**What breaks the attack**: WD should open its update files with `FILE_FLAG_OPEN_REPARSE_POINT` (to skip junction traversal) or validate that the resolved file path matches the expected update directory before reading.
+
+**Current behavior**: WD opens `mpasbase.vdm` via `CreateFile` or equivalent, transparently following the junction to `\BaseNamedObjects\Restricted` and then the NT symlink to the SAM hive.
+
+**Recommended control**: Use `OPEN_REPARSE_POINT` semantics on privileged file reads, or compare the final file object path (via `NtQueryObject` on the opened handle) against an expected prefix.
+
+---
+
+### Stage 3 — Oplock-based I/O freeze
+
+**What breaks the attack**: Rate-limit or audit batch oplock requests on files in the Windows Defender update path. Anomalous oplock patterns from non-WD processes on files under `ProgramData\Microsoft\Windows Defender` should trigger an alert.
+
+**Current behavior**: Any process can request a batch oplock on any file it has opened. The PoC uses this on `mpasbase.vdm` to receive a notification exactly when WD attempts to open the file.
+
+**Recommended control**: Windows Defender's protected service could hold files open with `FILE_SHARE_NONE` to prevent third-party oplocks, or monitor for oplock breaks on its update files.
+
+---
+
+### Stage 4 — VSS SAM access
+
+**What breaks the attack**: Restrict user-mode access to VSS device objects. By default, `\Device\HarddiskVolumeShadowCopy*` devices may be accessible to standard users, allowing traversal to protected registry hive files that are unlocked in the snapshot.
+
+**Recommended control**: Apply ACLs to VSS device objects so that only SYSTEM and Administrators can open them. Alternatively, ensure that VSS-backed copies of `SAM`, `SYSTEM`, and `SECURITY` hives inherit restrictive DACLs.
+
+## Defensive monitoring
+
+These events are observable using Windows ETW, Sysmon, or an EDR:
+
+| Event | Detection signal |
+|---|---|
+| `NtCreateSymbolicLinkObject` calls targeting `\BaseNamedObjects\Restricted\*` from non-system processes | High-fidelity indicator |
+| Junction creation in `%TEMP%` pointing to `\BaseNamedObjects\*` | High-fidelity indicator |
+| `CfRegisterSyncRoot` calls from processes not associated with a known cloud sync provider | Medium-fidelity indicator |
+| Batch oplock requests on files under `C:\ProgramData\Microsoft\Windows Defender\Definition Updates\` | Medium-fidelity indicator |
+| `ReadDirectoryChangesW` on `C:\ProgramData\Microsoft\Windows Defender\Definition Updates` from a non-WD process | Low-fidelity, needs correlation |
+| New `HarddiskVolumeShadowCopy` device creation immediately followed by a privileged file read | Correlate VSS events with file access |
+
+## General hardening
+
+<AccordionGroup>
+  <Accordion title="Keep Windows Defender updated">
+    The RPC method abused by BlueHammer (`Proc42_ServerMpUpdateEngineSignature`) may be patched or access-controlled in newer WD versions. Apply Microsoft security updates promptly. Check the [Microsoft Security Update Guide](https://msrc.microsoft.com/update-guide) for CVEs related to Windows Defender update handling.
+  </Accordion>
+
+  <Accordion title="Enable Credential Guard">
+    Windows Defender Credential Guard isolates LSASS secrets using virtualization-based security (VBS). Even if an attacker extracts NTLM hashes from the SAM hive, Credential Guard prevents those hashes from being used for pass-the-hash attacks against protected accounts.
+
+    Enable via Group Policy: **Computer Configuration → Administrative Templates → System → Device Guard → Turn On Virtualization Based Security**.
+  </Accordion>
+
+  <Accordion title="Deploy LAPS">
+    Local Administrator Password Solution (LAPS) ensures every machine has a unique local administrator password, stored in Active Directory. This limits the blast radius of NTLM hash extraction — a hash from one machine cannot be replayed against others.
+  </Accordion>
+
+  <Accordion title="Restrict ALPC port access">
+    The Windows Defender `IMpService` ALPC port is the entry point for Stage 1. Group Policy or AppLocker rules restricting which processes can call into WD's RPC interface reduce the attack surface.
+  </Accordion>
+</AccordionGroup>
+
+## Related vulnerability pages
+
+<CardGroup cols={2}>
+  <Card title="WD update abuse" icon="bug" href="/vulnerability/windows-defender-update-abuse">
+    Details of the RPC path validation weakness.
+  </Card>
+  <Card title="VSS freeze technique" icon="lock" href="/vulnerability/vss-freeze-technique">
+    How the oplock and Cloud Files API are used to freeze WD.
+  </Card>
+  <Card title="SAM extraction" icon="database" href="/vulnerability/sam-extraction">
+    Junction, symlink, and offline SAM decryption details.
+  </Card>
+  <Card title="Attack chain" icon="diagram-project" href="/reference/attack-chain">
+    Full sequential breakdown of the exploit flow.
+  </Card>
+</CardGroup>

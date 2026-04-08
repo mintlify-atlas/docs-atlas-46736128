@@ -1,0 +1,84 @@
+---
+title: "Introduction"
+description: "BlueHammer is a Windows security research proof-of-concept that chains Windows Defender update abuse, VSS snapshot creation, SAM file extraction, and privilege escalation into a single exploit sequence."
+---
+
+<Warning>
+  BlueHammer is published strictly for security research and educational purposes. Running this PoC against systems you do not own or have explicit written permission to test is illegal. The authors and contributors accept no liability for misuse.
+</Warning>
+
+## What is BlueHammer?
+
+BlueHammer is a proof-of-concept exploit targeting x64 Windows systems with Windows Defender enabled. It demonstrates a chained attack that:
+
+1. Abuses Windows Defender's trusted signature-update mechanism to feed it a redirected file path
+2. Creates a Volume Shadow Copy (VSS) snapshot to obtain a read-unlocked copy of the SAM hive
+3. Freezes Windows Defender's I/O mid-update using Cloud Files oplocks
+4. Redirects Defender's file read to the VSS copy of `\Windows\System32\Config\SAM` using NTFS junctions and NT object-manager symbolic links
+5. Extracts every local account's NTLM hash from the leaked SAM hive
+6. Temporarily changes each account's password, logs on interactively, spawns a SYSTEM shell via a transient service, then restores the original password
+
+The PoC was written in C++ and relies entirely on documented Windows APIs — no kernel exploits are involved.
+
+## Vulnerability context
+
+Windows Defender (`MsMpEng.exe`) runs as the `LocalSystem` account and exposes an ALPC/RPC service port. One of its RPC procedures, `Proc42_ServerMpUpdateEngineSignature`, accepts a caller-supplied directory path and instructs the service to load signature files from that location. Because the service is highly privileged and the update path is fully user-controlled, an unprivileged caller can direct Defender to read arbitrary files by manipulating the filesystem namespace before Defender opens them.
+
+The trust model Windows Defender applies to caller-supplied update paths is the root cause: the service does not validate that the path resolves to a Microsoft-signed update package before opening files within it. By combining this with NTFS junction points and NT symbolic links — which are resolved in kernel space — a low-privileged attacker can substitute any file for any update component Defender expects to read.
+
+## Affected versions
+
+BlueHammer targets:
+
+- **Platform**: x64 Windows (tested on Windows 10 and Windows 11)
+- **Antivirus**: Windows Defender (built-in `MsMpEng.exe`), any version that exposes the `IMpService77BDAF73-B396-481F-9042-AD358843EC24` RPC endpoint
+- **Prerequisite**: A pending Windows Defender signature update must be available or triggerable from Windows Update; without one the PoC polls and waits
+
+<Note>
+  The PoC targets the `mpasbase.vdm` signature file specifically. Other update components (`mpengine.dll`, etc.) could in principle be substituted, but the current code redirects only `mpasbase.vdm`.
+</Note>
+
+## Known limitations
+
+From the author's own disclosure:
+
+> There are few bugs in the PoC that could prevent it from working, might fix them later.
+
+Observed failure modes include:
+
+- `Proc42_ServerMpUpdateEngineSignature` returning `0x8050A003` when the pending update is not the expected type — the PoC will stall or bail out in this case
+- Race conditions between the oplock-based freeze and Defender's I/O scheduling; the freeze window may close before the junction/symlink swap completes
+- The VSS creation step depends on the system's VSS service being operational and the current user having sufficient COM activation rights
+
+## Responsible disclosure
+
+The README carries a PGP-signed disclosure notice (SHA-512). The signed message reads:
+
+> Repository hosting the bluehammer vulnerability
+
+The signature attests to authorship and the timestamp of publication.
+
+## Research credit
+
+Special thanks are given at the top of `FunnyApp.cpp` to the researchers whose prior public work made this PoC possible:
+
+- **Tom Gallagher**
+- **Igor Tsyganskiy**
+- **Jeremy Tinder**
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="How it works" icon="gear" href="/how-it-works">
+    A stage-by-stage technical walkthrough of the full attack chain with annotated source code.
+  </Card>
+  <Card title="WD update abuse" icon="shield-halved" href="/vulnerability/windows-defender-update-abuse">
+    Deep dive into the Windows Defender RPC trust boundary and how the update path is abused.
+  </Card>
+  <Card title="Prerequisites" icon="list-check" href="/usage/prerequisites">
+    What you need to build and run BlueHammer in a research environment.
+  </Card>
+  <Card title="Attack chain reference" icon="diagram-project" href="/reference/attack-chain">
+    Concise reference table mapping each stage to the responsible functions and Windows APIs.
+  </Card>
+</CardGroup>

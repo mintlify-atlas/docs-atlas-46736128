@@ -1,97 +1,61 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "BlueHammer"
+description: "Windows security research PoC demonstrating a vulnerability chain that abuses Windows Defender's privileged update mechanism to extract the SAM database and escalate privileges."
 ---
 
-## Setting up
+BlueHammer is a proof-of-concept exploit that chains several Windows primitives together to read files that are normally inaccessible — including the live SAM database — and subsequently escalate privileges by decrypting local account NTLM hashes.
 
-Get your documentation site up and running in minutes.
+<Warning>
+  This repository is published for **security research and educational purposes only**. The code demonstrates a real vulnerability chain. Running it on systems you do not own or have explicit permission to test is illegal and unethical.
+</Warning>
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="How it works" icon="diagram-project" href="/how-it-works">
+    Understand the full vulnerability chain from update trigger to SYSTEM shell.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Prerequisites" icon="list-check" href="/usage/prerequisites">
+    System requirements and setup before building or running the PoC.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Vulnerability details" icon="bug" href="/vulnerability/windows-defender-update-abuse">
+    Deep dive into the Windows Defender update abuse technique.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Technical reference" icon="code" href="/reference/key-functions">
+    Annotated reference for every key function in the codebase.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Attack overview
 
-Everything you need to create world-class documentation.
+The exploit chains four distinct stages:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Trigger a Windows Defender signature update">
+    BlueHammer waits for a pending WD signature update, downloads the update package directly, and calls `ServerMpUpdateEngineSignature` over ALPC/RPC to instruct WD to process it from an attacker-controlled directory.
+  </Step>
+  <Step title="Create and freeze a Volume Shadow Copy">
+    An EICAR test file causes WD to perform a scan. During the scan, a Cloud Files sync-root callback intercepts WD's directory query and uses an oplock on a `.lock` file to freeze WD's I/O at a precise moment — while a Volume Shadow Copy of the system volume is created.
+  </Step>
+  <Step title="Redirect WD's file read to the SAM hive">
+    With WD frozen and the VSS mounted, a junction + NT object-manager symbolic link redirects WD's next privileged file open (`mpasbase.vdm`) to `\Device\HarddiskVolumeShadowCopyN\Windows\System32\Config\SAM`. WD reads the SAM file on behalf of the attacker.
+  </Step>
+  <Step title="Decrypt hashes and escalate privileges">
+    The leaked SAM hive is parsed offline. Using the LSA boot key extracted from the live registry, all local account NTLM hashes are decrypted. Passwords are temporarily changed to log on as each admin user, launch a SYSTEM-level service, and then restored.
+  </Step>
+</Steps>
 
-## Need inspiration?
+## Key techniques
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="WD RPC abuse" icon="network-wired" href="/vulnerability/windows-defender-update-abuse">
+    Calling `ServerMpUpdateEngineSignature` (Proc42) over the Windows Defender ALPC port with an attacker-controlled directory path.
+  </Card>
+  <Card title="Oplock + Cloud Files freeze" icon="lock" href="/vulnerability/vss-freeze-technique">
+    Using `FSCTL_REQUEST_BATCH_OPLOCK` and the Cloud Files API to freeze Windows Defender at a deterministic I/O point.
+  </Card>
+  <Card title="NT symlink injection" icon="link" href="/vulnerability/sam-extraction">
+    Creating NT object-manager symbolic links under `\BaseNamedObjects\Restricted` to redirect WD's privileged file read.
+  </Card>
+  <Card title="Offline SAM decryption" icon="key" href="/reference/key-functions">
+    Parsing the SAM hive with `offreg.dll`, extracting the boot key, and decrypting NTLM hashes with AES-128-CBC + DES-ECB.
+  </Card>
+</CardGroup>

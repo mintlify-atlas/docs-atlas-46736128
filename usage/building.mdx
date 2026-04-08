@@ -1,0 +1,70 @@
+---
+title: "Building"
+description: "How to compile BlueHammer from source using Visual Studio."
+---
+
+<Warning>
+  Only build and run BlueHammer on systems you own or have explicit written authorization to test.
+</Warning>
+
+## Build steps
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/Nightmare-Eclipse/BlueHammer.git
+    cd BlueHammer
+    ```
+  </Step>
+
+  <Step title="Open the solution in Visual Studio">
+    Open `FunnyApp.sln` in Visual Studio 2019 or 2022. The solution contains a single project: `FunnyApp`.
+  </Step>
+
+  <Step title="Set configuration and platform">
+    In the toolbar dropdowns, select:
+    - **Configuration**: `Release`
+    - **Platform**: `x64`
+
+    <Note>
+      The project only targets x64. A 32-bit build is not supported — the code uses 64-bit NT structures and pointer arithmetic throughout.
+    </Note>
+  </Step>
+
+  <Step title="Build the solution">
+    Press `Ctrl+Shift+B` or go to **Build → Build Solution**.
+
+    A successful build produces:
+    ```
+    x64\Release\FunnyApp.exe
+    ```
+  </Step>
+</Steps>
+
+## What gets compiled
+
+The project compiles these source files:
+
+| File | Purpose |
+|---|---|
+| `FunnyApp.cpp` | Main exploit logic — all stages of the attack chain |
+| `windefend_c.c` | RPC client stub (auto-generated from `windefend.idl`) |
+| `windefend_s.c` | RPC server stub (included for completeness) |
+
+The pre-built `offreg.lib` is linked statically — it provides the offline registry API (`OROpenHive`, `OROpenKey`, `ORGetValue`, etc.) used to parse the leaked SAM hive.
+
+## Expected build output
+
+```
+Build started...
+1>------ Build started: Project: FunnyApp, Configuration: Release x64 ------
+1>FunnyApp.cpp
+1>windefend_c.c
+1>windefend_s.c
+1>FunnyApp.vcxproj -> ...\BlueHammer\x64\Release\FunnyApp.exe
+========== Build: 1 succeeded, 0 failed ==========
+```
+
+<Tip>
+  If you see warnings about deprecated CRT functions (`_CRT_SECURE_NO_WARNINGS` suppresses most of them — this define is already at the top of `FunnyApp.cpp`).
+</Tip>

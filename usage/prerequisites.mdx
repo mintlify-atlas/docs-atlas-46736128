@@ -1,0 +1,72 @@
+---
+title: "Prerequisites"
+description: "System requirements and dependencies needed before building or running BlueHammer."
+---
+
+<Warning>
+  BlueHammer is a security research proof-of-concept. Only run it on systems you own or have explicit written permission to test. Unauthorized use is illegal.
+</Warning>
+
+## Target system (runtime)
+
+BlueHammer targets **x64 Windows 10 or Windows 11** with Windows Defender enabled.
+
+| Requirement | Details |
+|---|---|
+| Architecture | x64 only |
+| OS | Windows 10 / Windows 11 |
+| Windows Defender | Must be running (`WinDefend` service active) |
+| Pending WD update | At least one Definition Update for Microsoft Defender Antivirus must be available via Windows Update |
+| Internet access | Required — downloads the update package (~100 MB) from `go.microsoft.com` |
+| Volume Shadow Copy Service | VSS must be enabled and operational |
+| Local accounts | At least one other local user account must exist for the privilege escalation stage |
+| Execution context | Run as a **standard user** — not as SYSTEM (the binary detects SYSTEM and behaves differently) |
+
+<Note>
+  The PoC waits in a 30-second loop for a pending Windows Defender signature update. If no update is currently available, execution will stall until one appears. Forcing a check via **Windows Update → Check for updates** can speed this up.
+</Note>
+
+## Build environment
+
+| Requirement | Details |
+|---|---|
+| IDE | Visual Studio 2019 or 2022 |
+| Workload | Desktop development with C++ |
+| Platform toolset | v142 or v143 (MSVC) |
+| Target platform | x64 Release only |
+| Windows SDK | 10.0 or later (for `cfapi.h`, `wuapi.h`, `ktmw32.h`) |
+
+## Included dependencies
+
+The following are already present in the repository — no separate downloads are needed:
+
+- **`offreg.lib` / `offreg.h`** — Microsoft's offline registry library, used to parse the leaked SAM hive without loading it into the live registry.
+- **`windefend_h.h`, `windefend_c.c`, `windefend_s.c`** — Pre-generated RPC stub files from `windefend.idl`, providing the `Proc42_ServerMpUpdateEngineSignature` function binding.
+
+## Linked system libraries
+
+These are linked automatically via `#pragma comment(lib, ...)` in `FunnyApp.cpp` — no manual project configuration is needed:
+
+```
+wininet.lib    — WinInet HTTP download of the update package
+ktmw32.lib     — Kernel Transaction Manager (imported but not used in final flow)
+Shlwapi.lib    — PathFindFileName, ExpandEnvironmentStrings helpers
+Rpcrt4.lib     — RPC runtime (RpcStringBindingComposeW, RpcBindingFromStringBindingW)
+ntdll.lib      — NT native API (NtCreateFile, NtCreateSymbolicLinkObject, etc.)
+Cabinet.lib    — FDI cabinet extraction API
+Wuguid.lib     — Windows Update Agent COM GUIDs
+CldApi.lib     — Cloud Files API (CfRegisterSyncRoot, CfConnectSyncRoot, CfExecute)
+```
+
+<Info>
+  OpenSSL headers appear commented out in `FunnyApp.cpp` (lines 23–30). The implementation uses the Windows CryptoAPI (`CryptAcquireContext`, `CryptDecrypt`, `CryptCreateHash`) instead — OpenSSL is not required.
+</Info>
+
+<CardGroup cols={2}>
+  <Card title="Building" icon="hammer" href="/usage/building">
+    Step-by-step Visual Studio build instructions.
+  </Card>
+  <Card title="Running" icon="play" href="/usage/running">
+    How to execute the PoC and interpret its output.
+  </Card>
+</CardGroup>

